@@ -23,6 +23,10 @@
 #include "nova.h"
 #include "inode.h"
 
+#ifdef CONFIG_DAXVM
+	#include <linux/pfn_t.h>
+	#include "./daxvm/daxvm.h"
+#endif
 
 static inline int nova_can_set_blocksize_hint(struct inode *inode,
 	struct nova_inode *pi, loff_t new_size)
@@ -263,11 +267,19 @@ static long nova_fallocate(struct file *file, int mode, loff_t offset,
 		}
 
 		/* Allocate zeroed blocks to fill hole */
+#ifndef CONFIG_DAXVM
 		allocated = nova_new_data_blocks(sb, sih, &blocknr, start_blk,
 				 ent_blks, ALLOC_INIT_ZERO, ANY_CPU,
 				 ALLOC_FROM_HEAD);
 		nova_dbgv("%s: alloc %d blocks @ %lu\n", __func__,
 						allocated, blocknr);
+#else
+		allocated = nova_new_data_blocks(sb, sih, &blocknr, start_blk,
+				 ent_blks, nova_zeroout, ANY_CPU,
+				 ALLOC_FROM_HEAD);
+		nova_dbgv("%s: alloc %d blocks @ %lu\n", __func__,
+						allocated, blocknr);
+#endif
 
 		if (allocated <= 0) {
 			nova_dbg("%s alloc %lu blocks failed!, %d\n",
@@ -361,8 +373,19 @@ static int nova_iomap_begin_nolock(struct inode *inode, loff_t offset,
 	return nova_iomap_begin(inode, offset, length, flags, iomap, false);
 }
 
+#ifdef CONFIG_DAXVM
+static int nova_iomap_daxvm_get_pfn(struct inode *inode, loff_t pos, size_t size, pfn_t *pfnp)
+{
+	return nova_daxvm_get_pfn(inode, pos, size, pfnp);
+}
+#endif
+
+
 static struct iomap_ops nova_iomap_ops_nolock = {
 	.iomap_begin	= nova_iomap_begin_nolock,
+#ifdef CONFIG_DAXVM
+	.iomap_daxvm_get_pfn		= nova_iomap_daxvm_get_pfn,
+#endif
 	.iomap_end	= nova_iomap_end,
 };
 
@@ -896,9 +919,15 @@ static int nova_dax_file_mmap(struct file *file, struct vm_area_struct *vma)
 
 	file_accessed(file);
 
-	vma->vm_flags |= VM_MIXEDMAP | VM_HUGEPAGE;
+//	vma->vm_flags |= VM_MIXEDMAP | VM_HUGEPAGE;
+	vma->vm_flags |= VM_MIXEDMAP;
 
 	vma->vm_ops = &nova_dax_vm_ops;
+
+#ifdef CONFIG_DAXVM
+	if(vma->vm_flags & VM_DAXVM)
+		nova_daxvm_attach_tables(vma, inode);	
+#endif
 
 	nova_insert_write_vma(vma);
 
@@ -921,6 +950,9 @@ const struct file_operations nova_dax_file_operations = {
 	.write_iter		= nova_dax_write_iter,
 	.mmap			= nova_dax_file_mmap,
 	.mmap_supported_flags 	= MAP_SYNC,
+#ifdef CONFIG_DAXVM
+	.get_unmapped_area = thp_get_unmapped_area,
+#endif
 	.open			= nova_open,
 	.fsync			= nova_fsync,
 	.flush			= nova_flush,

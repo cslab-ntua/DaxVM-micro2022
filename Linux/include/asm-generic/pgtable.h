@@ -968,6 +968,11 @@ static inline int pmd_none_or_trans_huge_or_clear_bad(pmd_t *pmd)
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 	barrier();
 #endif
+
+#ifdef CONFIG_DAXVM
+    //race munmap with msync (same as huge pages)
+    if (is_pmd_daxvm(pmdval)) return 1;
+#endif
 	/*
 	 * !pmd_present() checks for pmd migration entries
 	 *

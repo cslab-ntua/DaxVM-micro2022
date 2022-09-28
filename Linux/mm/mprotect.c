@@ -492,6 +492,14 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 
 	reqprot = prot;
 
+#ifdef CONFIG_DAXVM
+	down_read(&current->mm->mmap_sem);
+  vma = find_vma(current->mm,start);
+  up_read(&current->mm->mmap_sem);
+  if(vma->vm_flags & (VM_DAXVM | VM_DAXVM_EPHEMERAL_HEAP)) return -EINVAL;
+#endif
+
+
 	if (down_write_killable(&current->mm->mmap_sem))
 		return -EINTR;
 

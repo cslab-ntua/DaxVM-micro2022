@@ -33,6 +33,9 @@
 #include "ext4_jbd2.h"
 #include "xattr.h"
 #include "acl.h"
+#ifdef CONFIG_DAXVM
+	#include "daxvm/daxvm.h"
+#endif
 
 #ifdef CONFIG_FS_DAX
 static ssize_t ext4_dax_read_iter(struct kiocb *iocb, struct iov_iter *to)
@@ -277,6 +280,22 @@ out:
 }
 
 #ifdef CONFIG_FS_DAX
+
+#ifdef CONFIG_DAXVM
+static bool ext4_inode_datasync_dirty(struct inode *inode)
+{
+	journal_t *journal = EXT4_SB(inode->i_sb)->s_journal;
+
+	if (journal)
+		return !jbd2_transaction_committed(journal,
+					EXT4_I(inode)->i_datasync_tid);
+	/* Any metadata buffers to write? */
+	if (!list_empty(&inode->i_mapping->private_list))
+		return true;
+	return inode->i_state & I_DIRTY_DATASYNC;
+}
+#endif
+
 static vm_fault_t ext4_dax_huge_fault(struct vm_fault *vmf,
 		enum page_entry_size pe_size)
 {
@@ -286,7 +305,9 @@ static vm_fault_t ext4_dax_huge_fault(struct vm_fault *vmf,
 	handle_t *handle = NULL;
 	struct inode *inode = file_inode(vmf->vma->vm_file);
 	struct super_block *sb = inode->i_sb;
-
+#ifdef CONFIG_DAXVM
+	bool daxvm_set =0 ;
+#endif
 	/*
 	 * We have to distinguish real writes from writes which will result in a
 	 * COW page; COW writes should *not* poke the journal (the file will not
@@ -301,6 +322,110 @@ static vm_fault_t ext4_dax_huge_fault(struct vm_fault *vmf,
 	bool write = (vmf->flags & FAULT_FLAG_WRITE) &&
 		(vmf->vma->vm_flags & VM_SHARED);
 	pfn_t pfn;
+
+#ifdef CONFIG_DAXVM
+	if(vmf->vma->vm_flags & VM_DAXVM){
+		if(!write) {
+			down_read(&EXT4_I(inode)->i_mmap_sem);
+			daxvm_set = ext4_daxvm_fault(vmf,inode);
+			up_read(&EXT4_I(inode)->i_mmap_sem);
+			if (daxvm_set) return VM_FAULT_NOPAGE;
+		}
+		else if (pe_size == PE_SIZE_PTE){
+			sb_start_pagefault(sb);
+			file_update_time(vmf->vma->vm_file);
+			down_read(&EXT4_I(inode)->i_mmap_sem);
+daxvm_retry:
+			handle = ext4_journal_start_sb(sb, EXT4_HT_WRITE_PAGE,
+					       	EXT4_DATA_TRANS_BLOCKS(sb));
+			if (IS_ERR(handle)) {
+				up_read(&EXT4_I(inode)->i_mmap_sem);
+				sb_end_pagefault(sb);
+				return VM_FAULT_SIGBUS;
+			}
+
+			if(daxvm_msync_support){
+				result = dax_iomap_fault(vmf, pe_size, &pfn, &error, &ext4_dax_iomap_ops);
+			  ext4_journal_stop(handle);
+      }
+			else {
+			  ext4_journal_stop(handle);
+        if ((vmf->vma->vm_flags & VM_SYNC) && ext4_inode_datasync_dirty(inode)){
+            //pr_crit("%d Sync pte 0x%llx-0x%llx\n", vmf->vma->vm_file->f_inode->i_ino, vmf->pgoff<<PAGE_SHIFT, (vmf->pgoff<<PAGE_SHIFT) + (PAGE_SIZE << (PAGE_SHIFT - PAGE_SHIFT)) - 1);  
+            vfs_fsync_range(vmf->vma->vm_file, vmf->pgoff<<PAGE_SHIFT, (vmf->pgoff<<PAGE_SHIFT) + (PAGE_SIZE << (PAGE_SHIFT - PAGE_SHIFT)) - 1, 1);
+        }
+				daxvm_set = ext4_daxvm_file_mkwrite(vmf);
+      }
+
+
+			//FIXME SOMETHING IS WRONG with no-sync mode (rocksdb) 	
+			if(!daxvm_msync_support && daxvm_set) goto daxvm_pte_done;
+	
+			if ((result & VM_FAULT_ERROR) && error == -ENOSPC &&
+		    				ext4_should_retry_alloc(sb, &retries))
+				goto daxvm_retry;
+			/* Handling synchronous page fault? */
+			if (result & VM_FAULT_NEEDDSYNC) {
+				result = daxvm_finish_sync_fault(vmf, pe_size, pfn);
+			}
+		
+			daxvm_set = ext4_daxvm_fault(vmf,inode);
+
+daxvm_pte_done:
+			up_read(&EXT4_I(inode)->i_mmap_sem);
+			sb_end_pagefault(sb);
+			if(daxvm_set) return VM_FAULT_NOPAGE;
+		}
+		else if (pe_size == PE_SIZE_PMD){
+			
+			sb_start_pagefault(sb);
+			file_update_time(vmf->vma->vm_file);
+			down_read(&EXT4_I(inode)->i_mmap_sem);
+daxvm_pmd_retry:
+			handle = ext4_journal_start_sb(sb, EXT4_HT_WRITE_PAGE,
+					       EXT4_DATA_TRANS_BLOCKS(sb));
+			if (IS_ERR(handle)) {
+				up_read(&EXT4_I(inode)->i_mmap_sem);
+				sb_end_pagefault(sb);
+				return VM_FAULT_SIGBUS;
+			}
+			
+			if(daxvm_msync_support){
+				result = dax_iomap_fault(vmf, pe_size, &pfn, &error, &ext4_dax_iomap_ops);
+        ext4_journal_stop(handle);
+      }
+			else {
+        ext4_journal_stop(handle);
+        if ((vmf->vma->vm_flags & VM_SYNC) && ext4_inode_datasync_dirty(inode)) {
+
+            //pr_crit("%d Sync pmd 0x%llx-0x%llx\n", vmf->vma->vm_file->f_inode->i_ino, vmf->pgoff<<PAGE_SHIFT, (vmf->pgoff<<PAGE_SHIFT) + (PAGE_SIZE << (PMD_SHIFT - PAGE_SHIFT)) -1);  
+            vfs_fsync_range(vmf->vma->vm_file, vmf->pgoff<<PAGE_SHIFT, (vmf->pgoff<<PAGE_SHIFT) + (PAGE_SIZE << (PMD_SHIFT - PAGE_SHIFT)) -1, 1);
+        }
+				daxvm_set = ext4_daxvm_file_mkwrite(vmf);
+			}
+
+			//FIXME SOMETHING IS WRONG with no-sync mode (rocksdb)
+			if(!daxvm_msync_support && daxvm_set) goto daxvm_pmd_done;
+			if(!daxvm_msync_support && !daxvm_set) 
+				result = dax_iomap_fault(vmf, pe_size, &pfn, &error, &ext4_dax_iomap_ops);
+			
+			
+			if ((result & VM_FAULT_ERROR) && error == -ENOSPC &&
+		    				ext4_should_retry_alloc(sb, &retries))
+				goto daxvm_pmd_retry;
+
+			/* Handling synchronous page fault? */
+			if (result & VM_FAULT_NEEDDSYNC)
+				result = dax_finish_sync_fault(vmf, pe_size, pfn);
+daxvm_pmd_done:
+			up_read(&EXT4_I(inode)->i_mmap_sem);
+			sb_end_pagefault(sb);
+			if(daxvm_set) {
+        return VM_FAULT_NOPAGE;
+      }
+		}	
+	}
+#endif
 
 	if (write) {
 		sb_start_pagefault(sb);
@@ -332,6 +457,12 @@ retry:
 	} else {
 		up_read(&EXT4_I(inode)->i_mmap_sem);
 	}
+
+	if(vmf->vma->vm_flags & VM_DAXVM && vmf->vma->vm_flags&VM_DAXVM_EPHEMERAL){
+    		*vmf->pmd=pmd_mk_daxvm_ephemeral(*vmf->pmd);
+        //if(pe_size == PE_SIZE_PMD)
+          //pr_crit("%d %d %d\n", is_pmd_daxvm(*vmf->pmd), is_pmd_daxvm_ephemeral(*vmf->pmd), pmd_devmap(*vmf->pmd));
+  }
 
 	return result;
 }
@@ -374,7 +505,16 @@ static int ext4_file_mmap(struct file *file, struct vm_area_struct *vma)
 	file_accessed(file);
 	if (IS_DAX(file_inode(file))) {
 		vma->vm_ops = &ext4_dax_vm_ops;
-		vma->vm_flags |= VM_HUGEPAGE;
+		//vma->vm_flags |= VM_HUGEPAGE;
+#ifdef CONFIG_DAXVM
+		if(vma->vm_flags & VM_DAXVM){
+			down_read(&EXT4_I(inode)->i_data_sem);
+	    down_read(&EXT4_I(inode)->i_mmap_sem);
+			ext4_daxvm_attach_tables(vma, inode);	
+	    up_read(&EXT4_I(inode)->i_mmap_sem);
+			up_read(&EXT4_I(inode)->i_data_sem);
+		}
+#endif
 	} else {
 		vma->vm_ops = &ext4_file_vm_ops;
 	}
@@ -503,7 +643,7 @@ const struct file_operations ext4_file_operations = {
 	.compat_ioctl	= ext4_compat_ioctl,
 #endif
 	.mmap		= ext4_file_mmap,
-	.mmap_supported_flags = MAP_SYNC,
+	.mmap_supported_flags = (MAP_SYNC|MAP_DAXVM|MAP_DAXVM_BATCHING|MAP_DAXVM_EPHEMERAL),
 	.open		= ext4_file_open,
 	.release	= ext4_release_file,
 	.fsync		= ext4_sync_file,

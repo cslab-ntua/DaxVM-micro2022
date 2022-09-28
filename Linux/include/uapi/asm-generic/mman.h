@@ -15,6 +15,13 @@
 #define MAP_HUGETLB	0x40000		/* create a huge page mapping */
 #define MAP_SYNC	0x80000		/* perform synchronous page faults for the mapping */
 
+#ifdef CONFIG_DAXVM
+#define MAP_DAXVM			                    0x400000		
+#define MAP_DAXVM_EPHEMERAL     	        0x4000000    
+#define MAP_DAXVM_EPHEMERAL_HEAP     	    0x8000000    
+#define MAP_DAXVM_BATCHING		            0x200000		
+#endif
+
 /* Bits [26:31] are reserved, see mman-common.h for MAP_HUGETLB usage */
 
 #define MCL_CURRENT	1		/* lock all current mappings */

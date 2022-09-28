@@ -132,7 +132,8 @@ static int nova_delete_snapshot_list_entries(struct super_block *sb,
 	while (curr_p != list->tail) {
 		if (goto_next_list_page(sb, curr_p)) {
 			curr_p = next_list_page(curr_p);
-			continue;
+			if (curr_p == list->tail)
+				break;
 		}
 
 		if (curr_p == 0) {
@@ -217,8 +218,11 @@ static int nova_background_clean_snapshot_list(struct super_block *sb,
 					curr_p != list->tail) {
 		if (goto_next_list_page(sb, curr_p)) {
 			curr_p = next_list_page(curr_p);
+			if (curr_p == list->tail)
+				break;
 			curr_page = (struct nova_inode_log_page *)curr_p;
-			continue;
+			if (curr_page->page_tail.epoch_id == epoch_id)
+				break;
 		}
 
 		if (curr_p == 0) {
@@ -862,8 +866,8 @@ int nova_restore_snapshot_entry(struct super_block *sb,
 		goto out;
 	}
 
-	if (epoch_id >= sbi->s_epoch_id)
-		sbi->s_epoch_id = epoch_id + 1;
+	if (epoch_id > sbi->s_epoch_id)
+		sbi->s_epoch_id = epoch_id;
 
 out:
 	nova_clear_nvmm_page(sb, entry, just_init);
@@ -959,7 +963,7 @@ int nova_create_snapshot(struct super_block *sb)
 	nova_set_vmas_readonly(sb);
 
 	sbi->nova_sb->s_wtime = cpu_to_le32(get_seconds());
-	sbi->nova_sb->s_epoch_id = cpu_to_le64(epoch_id + 1);
+	sbi->nova_sb->s_epoch_id = cpu_to_le64(epoch_id);
 	nova_update_super_crc(sb);
 
 	nova_sync_super(sb);

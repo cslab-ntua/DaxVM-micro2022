@@ -62,7 +62,6 @@ int nova_insert_dir_tree(struct super_block *sb,
 
 	node->hash = hash;
 	node->direntry = direntry;
-	nova_update_range_node_checksum(node);     /* update checksum */
 	ret = nova_insert_range_node(&sih->rb_tree, node, NODE_DIR);
 	if (ret) {
 		nova_free_dir_node(node);
@@ -380,7 +379,7 @@ static int nova_inplace_update_dentry(struct super_block *sb,
  * already been logged for consistency
  */
 int nova_remove_dentry(struct dentry *dentry, int dec_link,
-	struct nova_inode_update *update, u64 epoch_id, bool rename)
+	struct nova_inode_update *update, u64 epoch_id)
 {
 	struct inode *dir = dentry->d_parent->d_inode;
 	struct super_block *sb = dir->i_sb;
@@ -415,7 +414,7 @@ int nova_remove_dentry(struct dentry *dentry, int dec_link,
 
 	dir->i_mtime = dir->i_ctime = current_time(dir);
 
-	if (!rename && nova_can_inplace_update_dentry(sb, old_dentry, epoch_id)) {
+	if (nova_can_inplace_update_dentry(sb, old_dentry, epoch_id)) {
 		nova_inplace_update_dentry(sb, dir, old_dentry,
 						dec_link, epoch_id);
 		curr_entry = nova_get_addr_off(sbi, old_dentry);

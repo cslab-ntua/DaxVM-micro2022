@@ -1532,6 +1532,18 @@ static struct ctl_table vm_table[] = {
 		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= &zero,
 	},
+
+#ifdef CONFIG_DAXVM
+	{
+		.procname	= "zombie_max_pages",
+		.data		= &sysctl_max_zombie_pages,
+		.maxlen		= sizeof(sysctl_max_zombie_pages),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &zero,
+	},
+#endif
+
 #else
 	{
 		.procname	= "nr_trim_pages",

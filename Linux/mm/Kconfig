@@ -1,5 +1,11 @@
 
 menu "Memory Management options"
+config DAXVM
+    bool "This is the DaxVM label"
+    default y
+    help
+      Experimental DaxVM
+
 
 config SELECT_MEMORY_MODEL
 	def_bool y

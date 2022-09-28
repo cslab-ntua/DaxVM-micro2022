@@ -45,8 +45,11 @@
 #include "xattr.h"
 #include "acl.h"
 #include "truncate.h"
-
 #include <trace/events/ext4.h>
+
+#ifdef CONFIG_DAXVM
+#include "./daxvm/daxvm.h"
+#endif
 
 #define MPAGE_DA_EXTENT_TAIL 0x01
 
@@ -286,6 +289,14 @@ void ext4_evict_inode(struct inode *inode)
 		goto stop_handle;
 	}
 	if (inode->i_blocks) {
+
+//#ifdef CONFIG_DAXVM
+//	      	if (IS_DAX(inode) && EXT4_I(inode)->jinode){
+//		      	if (ext4_persistent_page_tables){
+//           			ext4_daxvm_delete_tables(handle, inode, inode->i_sb, round_up(inode->i_size, PAGE_SIZE), round_up(EXT4_I(inode)->i_disksize, PAGE_SIZE), 1);
+//          		}
+//        	}
+//#endif
 		err = ext4_truncate(inode);
 		if (err) {
 			ext4_error(inode->i_sb,
@@ -3432,6 +3443,13 @@ static bool ext4_inode_datasync_dirty(struct inode *inode)
 	return inode->i_state & I_DIRTY_DATASYNC;
 }
 
+#ifdef CONFIG_DAXVM
+static int ext4_iomap_daxvm_get_pfn(struct inode *inode, loff_t pos, size_t size, pfn_t *pfnp)
+{
+	return ext4_daxvm_get_pfn(inode, pos, size, pfnp);
+}
+#endif
+
 static int ext4_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 			    unsigned flags, struct iomap *iomap)
 {
@@ -3513,8 +3531,14 @@ retry:
 		if (IS_ERR(handle))
 			return PTR_ERR(handle);
 
-		ret = ext4_map_blocks(handle, inode, &map,
+		if(flags & IOMAP_DAXVM && !ext4_zeroout){
+			ret = ext4_map_blocks(handle, inode, &map,
+				      EXT4_GET_BLOCKS_CREATE);
+		}
+		else
+			ret = ext4_map_blocks(handle, inode, &map,
 				      EXT4_GET_BLOCKS_CREATE_ZERO);
+
 		if (ret < 0) {
 			ext4_journal_stop(handle);
 			if (ret == -ENOSPC &&
@@ -3634,6 +3658,14 @@ const struct iomap_ops ext4_iomap_ops = {
 	.iomap_begin		= ext4_iomap_begin,
 	.iomap_end		= ext4_iomap_end,
 };
+
+#ifdef CONFIG_DAXVM
+const struct iomap_ops ext4_dax_iomap_ops = {
+	.iomap_begin			= ext4_iomap_begin,
+	.iomap_daxvm_get_pfn		= ext4_iomap_daxvm_get_pfn,
+	.iomap_end			= ext4_iomap_end,
+};
+#endif
 
 static int ext4_end_io_dio(struct kiocb *iocb, loff_t offset,
 			    ssize_t size, void *private)
@@ -4502,6 +4534,17 @@ int ext4_truncate(struct inode *inode)
 	if (IS_ERR(handle))
 		return PTR_ERR(handle);
 
+#ifdef CONFIG_DAXVM
+	  if (IS_DAX(inode) && EXT4_I(inode)->jinode){
+      if (ext4_persistent_page_tables){
+        //pr_crit("I am here %llu-%llu\n", round_up(inode->i_size,PAGE_SIZE), round_up(EXT4_I(inode)->i_disksize, PAGE_SIZE));
+        //ext4_daxvm_delete_tables(handle, inode, inode->i_sb, round_up(inode->i_size, PAGE_SIZE), round_up(EXT4_I(inode)->i_disksize, PAGE_SIZE),  1);
+        ext4_daxvm_delete_tables(handle, inode, inode->i_sb, round_up(inode->i_size, PAGE_SIZE), 0xffffffffff,  1);
+       }
+     }
+#endif
+
+	
 	if (inode->i_size & (inode->i_sb->s_blocksize - 1))
 		ext4_block_truncate_page(handle, mapping, inode->i_size);
 
@@ -4527,7 +4570,7 @@ int ext4_truncate(struct inode *inode)
 	else
 		ext4_ind_truncate(handle, inode);
 
-	up_write(&ei->i_data_sem);
+  up_write(&ei->i_data_sem);
 	if (err)
 		goto out_stop;
 
@@ -5616,7 +5659,9 @@ int ext4_setattr(struct dentry *dentry, struct iattr *attr)
 			 */
 			if (!error)
 				i_size_write(inode, attr->ia_size);
+
 			up_write(&EXT4_I(inode)->i_data_sem);
+
 			ext4_journal_stop(handle);
 			if (error) {
 				if (orphan)
@@ -5624,6 +5669,7 @@ int ext4_setattr(struct dentry *dentry, struct iattr *attr)
 				goto err_out;
 			}
 		}
+
 		if (!shrink)
 			pagecache_isize_extended(inode, oldsize, inode->i_size);
 

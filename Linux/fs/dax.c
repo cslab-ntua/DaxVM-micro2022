@@ -36,6 +36,10 @@
 #include <asm/pgalloc.h>
 #include "internal.h"
 
+#ifdef CONFIG_DAXVM
+#include "daxvm.h"
+#endif
+
 #define CREATE_TRACE_POINTS
 #include <trace/events/fs_dax.h>
 
@@ -750,8 +754,10 @@ static void *dax_insert_entry(struct xa_state *xas,
 		xas_load(xas);	/* Walk the xa_state */
 	}
 
-	if (dirty)
+	if (dirty){
+    //pr_crit("%d Tag 3 0x%llx\n", vmf->vma->vm_file->f_inode->i_ino, xas->xa_index);  
 		xas_set_mark(xas, PAGECACHE_TAG_DIRTY);
+  }
 
 	xas_unlock_irq(xas);
 	return entry;
@@ -796,6 +802,7 @@ static void dax_entry_mkclean(struct address_space *mapping, pgoff_t index,
 		if (follow_pte_pmd(vma->vm_mm, address, &range,
 				   &ptep, &pmdp, &ptl))
 			continue;
+    
 
 		/*
 		 * No need to call mmu_notifier_invalidate_range() as we are
@@ -805,6 +812,33 @@ static void dax_entry_mkclean(struct address_space *mapping, pgoff_t index,
 		 * See Documentation/vm/mmu_notifier.rst
 		 */
 		if (pmdp) {
+#ifdef CONFIG_DAXVM
+			if (is_pmd_daxvm(*pmdp)){
+				pmd_t pmd;
+				pmd = pmdp_huge_clear_flush(vma, address, pmdp);
+				pmd = pmd_wrprotect(pmd);
+				pmd = pmd_mkclean(pmd);
+				set_pmd_at(vma->vm_mm, address, pmdp, pmd);
+			}
+			else {			
+#ifdef CONFIG_FS_DAX_PMD
+			  pmd_t pmd;
+
+			  if (pfn != pmd_pfn(*pmdp))
+				  goto unlock_pmd;
+			  if (!pmd_dirty(*pmdp) && !pmd_write(*pmdp))
+				  goto unlock_pmd;
+
+			  flush_cache_page(vma, address, pfn);
+			  pmd = pmdp_huge_clear_flush(vma, address, pmdp);
+			  pmd = pmd_wrprotect(pmd);
+			  pmd = pmd_mkclean(pmd);
+			  set_pmd_at(vma->vm_mm, address, pmdp, pmd);
+			}
+unlock_pmd:
+#endif
+	
+#else
 #ifdef CONFIG_FS_DAX_PMD
 			pmd_t pmd;
 
@@ -819,6 +853,7 @@ static void dax_entry_mkclean(struct address_space *mapping, pgoff_t index,
 			pmd = pmd_mkclean(pmd);
 			set_pmd_at(vma->vm_mm, address, pmdp, pmd);
 unlock_pmd:
+#endif
 #endif
 			spin_unlock(ptl);
 		} else {
@@ -958,6 +993,7 @@ int dax_writeback_mapping_range(struct address_space *mapping,
 
 	xas_lock_irq(&xas);
 	xas_for_each_marked(&xas, entry, end_index, PAGECACHE_TAG_TOWRITE) {
+    //pr_crit("Found 0x%llx!\n", xas.xa_index);  
 		ret = dax_writeback_one(&xas, dax_dev, mapping, entry);
 		if (ret < 0) {
 			mapping_set_error(mapping, ret);
@@ -1195,6 +1231,9 @@ dax_iomap_rw(struct kiocb *iocb, struct iov_iter *iter,
 	loff_t pos = iocb->ki_pos, ret = 0, done = 0;
 	unsigned flags = 0;
 
+#ifdef CONFIG_DAXVM
+	flags |= IOMAP_DAXVM;
+#endif
 	if (iov_iter_rw(iter) == WRITE) {
 		lockdep_assert_held_exclusive(&inode->i_rwsem);
 		flags |= IOMAP_WRITE;
@@ -1248,6 +1287,9 @@ static vm_fault_t dax_iomap_pte_fault(struct vm_fault *vmf, pfn_t *pfnp,
 	int error, major = 0;
 	bool write = vmf->flags & FAULT_FLAG_WRITE;
 	bool sync;
+#ifdef CONFIG_DAXVM
+	bool daxvm_sync;
+#endif
 	vm_fault_t ret = 0;
 	void *entry;
 	pfn_t pfn;
@@ -1258,19 +1300,163 @@ static vm_fault_t dax_iomap_pte_fault(struct vm_fault *vmf, pfn_t *pfnp,
 	 * to hold locks serializing us with truncate / punch hole so this is
 	 * a reliable test.
 	 */
+
+#ifdef CONFIG_DAXVM
+	flags |= IOMAP_DAXVM;
+/*
+	if(vmf->vma->vm_flags & VM_DAXVM && write && is_pmd_daxvm(*vmf->pmd) && !daxvm_msync_support){
+		if(ops->iomap_daxvm_get_pfn){
+        error = ops->iomap_daxvm_get_pfn(inode, pos, PAGE_SIZE, &pfn);
+        if(error == 0)
+             return VM_FAULT_NOPAGE;
+		}
+  }
+*/
+#endif
+
 	if (pos >= i_size_read(inode)) {
 		ret = VM_FAULT_SIGBUS;
 		goto out;
 	}
 
-	if (write && !vmf->cow_page)
+	if (write && !vmf->cow_page) 
 		flags |= IOMAP_WRITE;
-
+	
 	entry = grab_mapping_entry(&xas, mapping, 0);
 	if (xa_is_internal(entry)) {
 		ret = xa_to_internal(entry);
 		goto out;
 	}
+
+
+#ifdef CONFIG_DAXVM
+
+	if (pmd_trans_huge(*vmf->pmd) || pmd_devmap(*vmf->pmd) && !is_pmd_daxvm(*vmf->pmd)) {
+		ret = VM_FAULT_NOPAGE;
+		goto unlock_entry;
+	}
+  	//adding all PMD pages to the page cache (2M) as after O(1) attachments we will not 
+  	//get any other permission faults to track dirty 4K pages
+	if(vmf->vma->vm_flags & VM_DAXVM && write && is_pmd_daxvm(*vmf->pmd) && daxvm_msync_support) {
+    dax_unlock_entry(&xas, entry);
+		loff_t start_vaddr;
+		loff_t start_pos;
+		pgoff_t start_pgoff;
+		pte_t * start_pte;
+		pgoff_t pgoff;
+		pgoff_t end_pgoff;
+		
+		start_vaddr = vaddr;
+		start_pos = pos;
+		start_pte = vmf->pte;
+
+		pos = pos & PMD_MASK;
+		pgoff = pos >> PAGE_SHIFT;
+		vaddr = vaddr & PMD_MASK;
+		end_pgoff = (pos+PMD_SIZE > inode->i_size) ? inode->i_size>>PAGE_SHIFT : pgoff + (1<<PMD_ORDER);
+		vmf->address=vaddr;
+		vmf->pgoff=pgoff;
+		if (vmf->cow_page) {
+			BUG();
+		}
+daxvm_loop:
+		start_pgoff = pos >> PAGE_SHIFT;
+		error = ops->iomap_begin(inode, pos, end_pgoff*PAGE_SIZE-pos, flags, &iomap);
+		if (iomap_errp)
+			*iomap_errp = error;
+		if (error) {
+			ret = dax_fault_return(error);
+			goto daxvm_error_finish_iomap;
+		}
+		if (WARN_ON_ONCE(iomap.offset + iomap.length < pos + PAGE_SIZE)) {
+			error = -EIO;	/* fs corruption? */
+			goto daxvm_error_finish_iomap;
+		}
+
+		if(iomap.type != IOMAP_MAPPED){
+			WARN_ON_ONCE(1);
+			error = -EIO;
+			goto daxvm_error_finish_iomap;
+		}
+
+		sync = dax_fault_is_synchronous(flags, vma, &iomap);
+		while (pgoff < (start_pgoff+(iomap.length>>PAGE_SHIFT))) {
+
+      if ((start_pos>>PAGE_SHIFT) == pgoff) daxvm_sync=sync;
+      else daxvm_sync=0;
+
+      //pr_crit("Xm %d\n", daxvm_sync);
+			XA_STATE(xas, &mapping->i_pages, pgoff);
+			entry = grab_mapping_entry(&xas, mapping, 0);
+			if (xa_is_internal(entry)) {
+				ret = xa_to_internal(entry);
+				goto daxvm_out;
+			}
+			
+			if (iomap.flags & IOMAP_F_NEW) {
+				count_vm_event(PGMAJFAULT);
+				count_memcg_event_mm(vma->vm_mm, PGMAJFAULT);
+				major = VM_FAULT_MAJOR;
+			}
+	
+			if(ops->iomap_daxvm_get_pfn){
+				error = ops->iomap_daxvm_get_pfn(inode, pos, PAGE_SIZE, &pfn);
+				if(error<0){
+					//pr_crit("%d Shortcut failed!\n", current->pid);
+					error = dax_iomap_pfn(&iomap, pos, PAGE_SIZE, &pfn);
+				}
+			}
+			else
+				error = dax_iomap_pfn(&iomap, pos, PAGE_SIZE, &pfn);
+			
+	
+			if (error < 0)
+				goto daxvm_error_finish_iomap;
+
+			entry = dax_insert_entry(&xas, mapping, vmf, entry, pfn,
+								 0, write && !daxvm_sync);
+
+			if (sync) {
+				if (WARN_ON_ONCE(!pfnp)) {
+					error = -EIO;
+					goto daxvm_error_finish_iomap;
+				}
+        if ((start_pos>>PAGE_SHIFT) == pgoff)  *pfnp = pfn;
+				ret = VM_FAULT_NEEDDSYNC | major;
+			}
+      else trace_dax_insert_mapping(inode, vmf, entry);
+daxvm_unlock_entry:
+			dax_unlock_entry(&xas, entry);
+daxvm_out:
+			vaddr+=PAGE_SIZE;
+			pos += PAGE_SIZE;
+			pgoff += 1;
+			vmf->address=vaddr;
+			vmf->pgoff=pgoff;
+			if(vmf->pte) vmf->pte++;			
+		}
+
+    if(sync) goto daxvm_finish_iomap;
+
+daxvm_error_finish_iomap:
+		ret = dax_fault_return(error);
+daxvm_finish_iomap:
+		if (ops->iomap_end) {
+			long long copied = iomap.length;
+			if (ret & VM_FAULT_ERROR)
+				copied = 0;
+			ops->iomap_end(inode, pos, copied, copied, flags, &iomap);
+		}
+		if(pgoff < end_pgoff)
+			goto daxvm_loop;
+
+		vmf->address=start_vaddr;
+		vmf->pgoff=start_pos>>PAGE_SHIFT;
+		vmf->pte = start_pte;
+		trace_dax_pte_fault_done(inode, vmf, ret);
+		return ret | major;
+	}
+#endif
 
 	/*
 	 * It is possible, particularly with mixed reads & writes to private
@@ -1474,6 +1660,19 @@ static vm_fault_t dax_iomap_pmd_fault(struct vm_fault *vmf, pfn_t *pfnp,
 	int error;
 	pfn_t pfn;
 
+
+#ifdef CONFIG_DAXVM
+	iomap_flags |= IOMAP_DAXVM;
+/*
+	if(vmf->vma->vm_flags & VM_DAXVM && write && !daxvm_msync_support){
+		if(ops->iomap_daxvm_get_pfn){
+               		error = ops->iomap_daxvm_get_pfn(inode, pos, PMD_SIZE, &pfn);
+               		if(error == 0)    		return VM_FAULT_NOPAGE;
+		}
+  }
+*/
+#endif
+
 	/*
 	 * Check whether offset isn't beyond end of file now. Caller is
 	 * supposed to hold locks serializing us with truncate / punch hole so
@@ -1512,6 +1711,7 @@ static vm_fault_t dax_iomap_pmd_fault(struct vm_fault *vmf, pfn_t *pfnp,
 	if ((xas.xa_index | PG_PMD_COLOUR) >= max_pgoff)
 		goto fallback;
 
+	
 	/*
 	 * grab_mapping_entry() will make sure we get an empty PMD entry,
 	 * a zero PMD entry or a DAX PMD.  If it can't (because a PTE
@@ -1679,6 +1879,7 @@ dax_insert_pfn_mkwrite(struct vm_fault *vmf, pfn_t pfn, unsigned int order)
 						      VM_FAULT_NOPAGE);
 		return VM_FAULT_NOPAGE;
 	}
+  //pr_crit("%d Tag 1 0x%llx\n", vmf->vma->vm_file->f_inode->i_ino, xas.xa_index);  
 	xas_set_mark(&xas, PAGECACHE_TAG_DIRTY);
 	dax_lock_entry(&xas, entry);
 	xas_unlock_irq(&xas);
@@ -1714,9 +1915,100 @@ vm_fault_t dax_finish_sync_fault(struct vm_fault *vmf,
 	unsigned int order = pe_order(pe_size);
 	size_t len = PAGE_SIZE << order;
 
+  //pr_crit("%d MapSync 0x%llx-0x%llx\n", vmf->vma->vm_file->f_inode->i_ino, start, start+len-1);  
 	err = vfs_fsync_range(vmf->vma->vm_file, start, start + len - 1, 1);
 	if (err)
 		return VM_FAULT_SIGBUS;
 	return dax_insert_pfn_mkwrite(vmf, pfn, order);
 }
 EXPORT_SYMBOL_GPL(dax_finish_sync_fault);
+
+
+#ifdef CONFIG_DAXVM
+daxvm_insert_pfn_mkwrite(struct vm_fault *vmf, pfn_t pfn, unsigned int order)
+{
+	struct address_space *mapping = vmf->vma->vm_file->f_mapping;
+	XA_STATE_ORDER(xas, &mapping->i_pages, vmf->pgoff, order);
+	void *entry;
+	vm_fault_t ret;
+
+	xas_lock_irq(&xas);
+	entry = get_unlocked_entry(&xas);
+	/* Did we race with someone splitting entry or so? */
+	if (!entry ||
+	    (order == 0 && !dax_is_pte_entry(entry)) ||
+	    (order == PMD_ORDER && !dax_is_pmd_entry(entry))) {
+		put_unlocked_entry(&xas, entry);
+		xas_unlock_irq(&xas);
+		trace_dax_insert_pfn_mkwrite_no_entry(mapping->host, vmf,
+						      VM_FAULT_NOPAGE);
+		return VM_FAULT_NOPAGE;
+	}
+  //pr_crit("%d Tag 2 0x%llx\n", vmf->vma->vm_file->f_inode->i_ino, xas.xa_index);  
+	xas_set_mark(&xas, PAGECACHE_TAG_DIRTY);
+	dax_lock_entry(&xas, entry);
+	xas_unlock_irq(&xas);
+	dax_unlock_entry(&xas, entry);
+	trace_dax_insert_pfn_mkwrite(mapping->host, vmf, ret);
+	return ret;
+}
+
+/*
+static vm_fault_t
+daxvm_insert_pfn_mkwrite(struct vm_fault *vmf, pfn_t pfn, unsigned int order)
+{
+	struct address_space *mapping = vmf->vma->vm_file->f_mapping;
+	void *entry;
+	vm_fault_t ret;
+		
+	pgoff_t pgoff = ((((loff_t)vmf->pgoff) << PAGE_SHIFT) & PMD_MASK) >> PAGE_SHIFT;
+	pgoff_t end_pgoff = ((pgoff + (1<<PMD_ORDER)) > (vmf->vma->vm_file->f_inode->i_size>>PAGE_SHIFT)) ? (vmf->vma->vm_file->f_inode->i_size>>PAGE_SHIFT) : (pgoff + (1<<PMD_ORDER));
+	while (pgoff < end_pgoff) {
+	
+		XA_STATE_ORDER(xas, &mapping->i_pages, pgoff, order);
+		xas_lock_irq(&xas);
+		entry = get_unlocked_entry(&xas);
+		if (!entry ||
+		    (order == 0 && !dax_is_pte_entry(entry)) ||
+		    (order == PMD_ORDER && !dax_is_pmd_entry(entry))) {
+		    put_unlocked_entry(&xas, entry);
+		    xas_unlock_irq(&xas);
+		    trace_dax_insert_pfn_mkwrite_no_entry(mapping->host, vmf,
+						      VM_FAULT_NOPAGE);
+		    return VM_FAULT_NOPAGE;
+		}
+
+    pr_crit("%d Tag 2 0x%llx\n", vmf->vma->vm_file->f_inode->i_ino, pgoff);  
+		xas_set_mark(&xas, PAGECACHE_TAG_DIRTY);
+		dax_lock_entry(&xas, entry);
+		xas_unlock_irq(&xas);
+		dax_unlock_entry(&xas, entry);
+		trace_dax_insert_pfn_mkwrite(mapping->host, vmf, ret);
+		pgoff++;
+	}
+	return 0;
+}
+*/
+
+vm_fault_t daxvm_finish_sync_fault(struct vm_fault *vmf,
+		enum page_entry_size pe_size, pfn_t pfn)
+{
+	int err;
+	loff_t start = ((loff_t)vmf->pgoff) << PAGE_SHIFT;
+	unsigned int order = pe_order(pe_size);
+	size_t len = PAGE_SIZE << order;
+	//loff_t start = (((loff_t)vmf->pgoff) << PAGE_SHIFT) & PMD_MASK;
+	//loff_t end = ((start + PMD_SIZE) > vmf->vma->vm_file->f_inode->i_size) ? vmf->vma->vm_file->f_inode->i_size : start + PMD_SIZE;
+	//size_t len;
+	//len = end-start;
+
+  //pr_crit("%d MapSync 0x%llx-0x%llx\n", vmf->vma->vm_file->f_inode->i_ino, start, start+len-1);  
+	err = vfs_fsync_range(vmf->vma->vm_file, start, start + len - 1, 1);
+	if (err)
+		return VM_FAULT_SIGBUS;
+
+	return daxvm_insert_pfn_mkwrite(vmf, pfn, order);
+}
+EXPORT_SYMBOL_GPL(daxvm_finish_sync_fault);
+#endif
+

@@ -338,6 +338,37 @@ struct vm_area_struct {
 	/* Flag for NOVA DAX cow */
 	int original_write;
 
+#ifdef CONFIG_DAXVM
+  //Batched unmapping (zombies)
+	struct vm_area_struct *zombie_vm_next, *zombie_vm_prev;
+	struct rb_node zombie_vm_rb;
+	unsigned long zombie_vm_end, zombie_vm_start; //used for unmapping, it is not the end of the vma but the beginning of the next in the real mmap list where the zombie was attached before unmapping
+
+	//distributed ephemeral heap
+  //VM_EPHEMERAL_HEAP
+  //
+  //to be attached to the mm_struct
+  struct vm_area_struct *ephemeral_heap_vm_prev, *ephemeral_heap_vm_next;
+	struct rb_node ephemeral_heap_vm_rb;
+  
+  //to host the file VMAS (below) functioning as a psueod mm struct
+  struct vm_area_struct *ephemeral_mmap;
+	struct rb_root ephemeral_mm_rb;
+	atomic_t ephemeral_mm_users;
+
+  /********************************************************/
+  
+  //this is the linkes list and the tree of the regural file vmas that now are undercover the ephemeral heap (non visible to the rest of the mm system right away)
+  //VM_EPHEMERAL
+	struct vm_area_struct *ephemeral_vm_prev, *ephemeral_vm_next;
+	struct rb_node ephemeral_vm_rb;
+
+  // ir is the current ephemeral_mm vma that serves allocation requests
+	atomic64_t heap_base;	
+	atomic64_t heap_free_pages;	
+	spinlock_t ephemeral_lock;
+#endif
+
 } __randomize_layout;
 
 struct core_thread {
@@ -506,6 +537,28 @@ struct mm_struct {
 		/* HMM needs to track a few things per mm */
 		struct hmm *hmm;
 #endif
+
+#ifdef CONFIG_DAXVM
+    //Batched unmapping (zombies)
+		atomic_t daxvm_munmap_inprogress;
+		struct vm_area_struct *zombie_mmap;
+		struct rb_root zombie_mm_rb;
+		int zombie_map_count;
+		atomic_t zombie_total_pages;
+
+    //ephemeral heap
+    //link list of all the vmas that form the heap (VM_EPHEMERAL_HEAP)
+		struct vm_area_struct *ephemeral_heap_mmap;
+    //the tree of all the vmas tha form the heap
+		struct rb_root ephemeral_heap_mm_rb;
+    //the current vma that serves allocation requests for ephemeral vmas
+		struct vm_area_struct *eheap;
+    // used for locking
+		atomic_t ephemeral_heap_extend;
+		spinlock_t ephemeral_zombie_lock;
+		spinlock_t ephemeral_heap_lock;
+#endif
+
 	} __randomize_layout;
 
 	/*

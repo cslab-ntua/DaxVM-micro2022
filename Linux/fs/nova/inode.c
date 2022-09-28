@@ -26,6 +26,10 @@
 #include "nova.h"
 #include "inode.h"
 
+#ifdef CONFIG_DAXVM
+	#include "./daxvm/daxvm.h"
+#endif
+
 unsigned int blk_type_to_shift[NOVA_BLOCK_TYPE_MAX] = {12, 21, 30};
 uint32_t blk_type_to_size[NOVA_BLOCK_TYPE_MAX] = {0x1000, 0x200000, 0x40000000};
 
@@ -341,8 +345,12 @@ int nova_delete_file_tree(struct super_block *sb,
 		freed += num_free;
 	}
 
+#ifdef CONFIG_DAXVM
+	nova_daxvm_delete_tables(sih, sb, start_blocknr << PAGE_SHIFT, pgoff << PAGE_SHIFT, delete_nvmm);
+#endif
+
 	nova_dbgv("Inode %lu: delete file tree from pgoff %lu to %lu, %d blocks freed\n",
-			sih->ino, start_blocknr, last_blocknr, freed);
+			sih->ino, start_blocknr, last_blocknr, pgoff, freed);
 
 	NOVA_END_TIMING(delete_file_tree_t, delete_time);
 	return freed;
@@ -1362,8 +1370,8 @@ void nova_set_inode_flags(struct inode *inode, struct nova_inode *pi,
 		inode->i_flags |= S_NOATIME;
 	if (flags & FS_DIRSYNC_FL)
 		inode->i_flags |= S_DIRSYNC;
-	if (!pi->i_xattr)
-		inode_has_no_xattr(inode);
+	//if (!pi->i_xattr)
+	//	inode_has_no_xattr(inode);
 	inode->i_flags |= S_DAX;
 }
 

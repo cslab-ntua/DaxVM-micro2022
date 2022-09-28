@@ -625,6 +625,13 @@ SYSCALL_DEFINE5(mremap, unsigned long, addr, unsigned long, old_len,
 	if (!new_len)
 		return ret;
 
+#ifdef CONFIG_DAXVM
+	down_read(&mm->mmap_sem);
+  vma = find_vma(mm,addr);
+  up_read(&mm->mmap_sem);
+  if(vma->vm_flags & (VM_DAXVM | VM_DAXVM_EPHEMERAL_HEAP)) return ret;
+#endif
+
 	if (down_write_killable(&current->mm->mmap_sem))
 		return -EINTR;
 

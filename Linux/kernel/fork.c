@@ -488,6 +488,19 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
 	mm->exec_vm = oldmm->exec_vm;
 	mm->stack_vm = oldmm->stack_vm;
 
+#ifdef CONFIG_DAXVM
+	mm->ephemeral_heap_mmap=NULL;
+	mm->eheap=NULL;
+	mm->ephemeral_heap_mm_rb=RB_ROOT;
+	atomic_set(&mm->ephemeral_heap_extend,0);
+
+
+	mm->zombie_mmap=NULL;
+	mm->zombie_mm_rb=RB_ROOT;
+	mm->zombie_map_count=0;
+	atomic_set(&mm->zombie_total_pages,0);
+#endif
+
 	rb_link = &mm->mm_rb.rb_node;
 	rb_parent = NULL;
 	pprev = &mm->mmap;
@@ -501,6 +514,11 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
 	prev = NULL;
 	for (mpnt = oldmm->mmap; mpnt; mpnt = mpnt->vm_next) {
 		struct file *file;
+
+#ifdef CONFIG_DAXVM
+		if(mpnt->vm_flags & VM_DAXVM_EPHEMERAL_HEAP)
+			continue;
+#endif
 
 		if (mpnt->vm_flags & VM_DONTCOPY) {
 			vm_stat_account(mm, mpnt->vm_flags, -vma_pages(mpnt));
@@ -995,6 +1013,20 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	mm->pmd_huge_pte = NULL;
 #endif
 	mm_init_uprobes_state(mm);
+
+#ifdef CONFIG_DAXVM
+	mm->ephemeral_heap_mmap = NULL;
+	mm->eheap = NULL;
+	mm->ephemeral_heap_mm_rb = RB_ROOT;
+	atomic_set(&mm->ephemeral_heap_extend,0);
+	spin_lock_init(&mm->ephemeral_heap_lock);
+	spin_lock_init(&mm->ephemeral_zombie_lock);
+
+	mm->zombie_mmap = NULL;
+	mm->zombie_mm_rb = RB_ROOT;
+	mm->zombie_map_count = 0;
+	atomic_set(&mm->zombie_total_pages,0);
+#endif
 
 	if (current->mm) {
 		mm->flags = current->mm->flags & MMF_INIT_MASK;

@@ -19,6 +19,10 @@
 
 #include "internal.h"
 
+#ifdef CONFIG_DAXVM
+unsigned long fast_mapping_vma_size = (4*(1ULL<<30)); //3GB pre-allocated address space;
+#endif
+
 /**
  * kfree_const - conditionally free memory
  * @x: pointer to the memory
@@ -345,6 +349,142 @@ int __weak get_user_pages_fast(unsigned long start,
 				       write ? FOLL_WRITE : 0);
 }
 EXPORT_SYMBOL_GPL(get_user_pages_fast);
+
+#ifdef CONFIG_DAXVM
+//Batching
+int sysctl_max_zombie_pages __read_mostly = DEFAULT_MAX_ZOMBIE_PAGES;
+int daxvm_max_zombie_ti = 0;
+int daxvm_zombie_ti = 0;
+
+void __zombie_vma_link_list(struct mm_struct *mm, struct vm_area_struct *vma,
+		struct vm_area_struct *prev, struct rb_node *rb_parent)
+{
+	struct vm_area_struct *next;
+
+	vma->zombie_vm_prev = prev;
+	if (prev) {
+		next = prev->zombie_vm_next;
+		prev->zombie_vm_next = vma;
+	} else {
+		mm->zombie_mmap = vma;
+		if (rb_parent)
+			next = rb_entry(rb_parent,
+					struct vm_area_struct, zombie_vm_rb);
+		else
+			next = NULL;
+	}
+	vma->zombie_vm_next = next;
+	if (next)
+		next->zombie_vm_prev = vma;
+}
+
+//Ephemeral
+void __ephemeral_mm_link_list(struct mm_struct *mm, struct vm_area_struct *vma,
+		struct vm_area_struct *prev, struct rb_node *rb_parent)
+{
+	struct vm_area_struct *next;
+
+	prev = mm->ephemeral_heap_mmap;
+	vma->ephemeral_heap_vm_next = prev;
+
+	if (prev) 
+		prev->ephemeral_heap_vm_prev = vma;
+	
+	mm->ephemeral_heap_mmap = vma;
+}
+
+void __ephemeral_vma_link_list(struct vm_area_struct *mm, struct vm_area_struct *vma,
+		struct vm_area_struct *prev, struct rb_node *rb_parent)
+{
+	struct vm_area_struct *next;
+
+	vma->ephemeral_vm_prev = prev;
+	if (prev) {
+		next = prev->ephemeral_vm_next;
+		prev->ephemeral_vm_next = vma;
+	} else {
+		mm->ephemeral_mmap = vma;
+		if (rb_parent)
+			next = rb_entry(rb_parent,
+					struct vm_area_struct, ephemeral_vm_rb);
+		else
+			next = NULL;
+	}
+	vma->ephemeral_vm_next = next;
+	if (next)
+		next->ephemeral_vm_prev = vma;
+	
+}
+
+extern void __insert_ephemeral_mm_struct(struct mm_struct *mm, struct vm_area_struct *vma);
+unsigned long vm_mmap_pgoff_ephemeral(struct file *file, unsigned long addr,
+  unsigned long len, unsigned long prot,
+  unsigned long flag, unsigned long pgoff)
+{
+	unsigned long ret;
+	struct mm_struct *mm = current->mm;
+	struct vm_area_struct *vma;
+	unsigned long populate;
+	s64 rounded_len;
+	LIST_HEAD(uf);
+
+	ret = security_mmap_file(file, prot, flag);
+	rounded_len = round_up(len+((pgoff-round_down(pgoff, PMD_SIZE>>PAGE_SHIFT))<<PAGE_SHIFT), PMD_SIZE);
+
+	if (!ret) {
+retry:
+		down_read(&mm->mmap_sem);
+		//Use the ephemeral heap
+		if(mm->eheap && (rounded_len>>PAGE_SHIFT)<=atomic64_fetch_sub(rounded_len>>PAGE_SHIFT, &mm->eheap->heap_free_pages)){
+			//is even this necessary?, currently yes for the scenarios 
+			//that we change the fast_mapping_vma; (refeeding stach address space)
+			ret = do_mmap_pgoff_ephemeral(file, addr, len, prot, flag, pgoff, &populate, &uf);
+			up_read(&mm->mmap_sem);
+		}
+		//expand the heap
+		else{
+			up_read(&mm->mmap_sem);
+			
+			if (atomic_read(&mm->ephemeral_heap_extend))
+				goto retry;
+
+			atomic_set(&mm->ephemeral_heap_extend, 1);
+
+			if (down_write_killable(&mm->mmap_sem))
+				return -EINTR;
+			
+			bool new_vma = 0;
+			int i=0;
+			vma = mm->ephemeral_heap_mmap;
+			while(vma){
+				if(!atomic_read(&vma->ephemeral_mm_users)) {
+					goto heapsetup;
+				}
+				vma = vma->ephemeral_heap_vm_next; 
+				i++;
+			}
+
+			new_vma = 1;
+			ret = do_mmap_pgoff(NULL, NULL, fast_mapping_vma_size, PROT_READ|PROT_WRITE, MAP_DAXVM_EPHEMERAL_HEAP, 0, &populate, &uf);
+			BUG_ON(ret<=0);
+			vma = find_vma(mm,ret);
+      BUG_ON(!vma);
+heapsetup:
+			mm->eheap = vma;
+			atomic64_set(&vma->heap_base, round_up(vma->vm_start,PMD_SIZE));
+			atomic64_set(&vma->heap_free_pages, (fast_mapping_vma_size-(round_up(vma->vm_start,PMD_SIZE)-vma->vm_start)) >> PAGE_SHIFT);
+			if(new_vma) { 
+				__insert_ephemeral_mm_struct(mm,vma);	
+			}
+			up_write(&mm->mmap_sem);
+			atomic_set(&mm->ephemeral_heap_extend, 0);
+			goto retry;
+		}
+
+	}
+	return ret;
+}
+#endif
 
 unsigned long vm_mmap_pgoff(struct file *file, unsigned long addr,
 	unsigned long len, unsigned long prot,

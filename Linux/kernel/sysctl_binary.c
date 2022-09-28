@@ -159,6 +159,9 @@ static const struct bin_table bin_vm_table[] = {
 	{ CTL_INT,	VM_LOWMEM_RESERVE_RATIO,	"lowmem_reserve_ratio" },
 	{ CTL_INT,	VM_MIN_FREE_KBYTES,		"min_free_kbytes" },
 	{ CTL_INT,	VM_MAX_MAP_COUNT,		"max_map_count" },
+#ifdef CONFIG_DAXVM
+	{ CTL_INT,	33,				"max_zombie_pages" },
+#endif
 	{ CTL_INT,	VM_LAPTOP_MODE,			"laptop_mode" },
 	{ CTL_INT,	VM_BLOCK_DUMP,			"block_dump" },
 	{ CTL_INT,	VM_HUGETLB_GROUP,		"hugetlb_shm_group" },

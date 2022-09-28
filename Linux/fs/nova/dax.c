@@ -21,6 +21,11 @@
 #include "nova.h"
 #include "inode.h"
 
+#ifdef CONFIG_DAXVM
+	#include <linux/pfn_t.h>
+	#include "./daxvm/daxvm.h"
+	int nova_zeroout = 1;
+#endif
 
 
 static inline int nova_copy_partial_block(struct super_block *sb,
@@ -867,7 +872,7 @@ int nova_check_overlap_vmas(struct super_block *sb,
 	return 0;
 }
 
-
+#ifndef CONFIG_DAXVM
 /*
  * return > 0, # of blocks mapped or allocated.
  * return = 0, if plain lookup failed.
@@ -1010,7 +1015,151 @@ out1:
 	NOVA_END_TIMING(dax_get_block_t, get_block_time);
 	return num_blocks;
 }
+#else 
+/*
+ * return > 0, # of blocks mapped or allocated.
+ * return = 0, if plain lookup failed.
+ * return < 0, error case.
+ */
+static int nova_dax_get_blocks(struct inode *inode, sector_t iblock,
+	unsigned long max_blocks, u32 *bno, bool *new, bool *boundary,
+	int create, int nozero, bool taking_lock)
+{
+	struct super_block *sb = inode->i_sb;
+	struct nova_inode *pi;
+	struct nova_inode_info *si = NOVA_I(inode);
+	struct nova_inode_info_header *sih = &si->header;
+	struct nova_file_write_entry *entry = NULL;
+	struct nova_file_write_entry *entryc, entry_copy;
+	struct nova_file_write_entry entry_data;
+	struct nova_inode_update update;
+	u32 time;
+	unsigned int data_bits;
+	unsigned long nvmm = 0;
+	unsigned long blocknr = 0;
+	u64 epoch_id;
+	int num_blocks = 0;
+	int inplace = 0;
+	int allocated = 0;
+	int locked = 0;
+	int check_next = 1;
+	int ret = 0;
+	unsigned long irq_flags = 0;
+	INIT_TIMING(get_block_time);
 
+	if (max_blocks == 0)
+		return 0;
+
+	NOVA_START_TIMING(dax_get_block_t, get_block_time);
+
+	nova_dbgv("%s: pgoff %lu, num %lu, create %d\n",
+				__func__, iblock, max_blocks, create);
+
+	epoch_id = nova_get_epoch_id(sb);
+
+	if (taking_lock)
+		check_next = 0;
+
+again:
+	num_blocks = nova_check_existing_entry(sb, inode, max_blocks,
+					iblock, &entry, &entry_copy, check_next,
+					epoch_id, &inplace, locked);
+
+	entryc = (metadata_csum == 0) ? entry : &entry_copy;
+
+	if (entry) {
+		if (create == 0 || inplace) {
+			nvmm = get_nvmm(sb, sih, entryc, iblock);
+			nova_dbgv("%s: found pgoff %lu, block %lu\n",
+					__func__, iblock, nvmm);
+			goto out;
+		}
+	}
+
+	if (create == 0) {
+		num_blocks = 0;
+		goto out1;
+	}
+
+	if (taking_lock && locked == 0) {
+		inode_lock(inode);
+		locked = 1;
+		/* Check again incase someone has done it for us */
+		check_next = 1;
+		goto again;
+	}
+
+	pi = nova_get_inode(sb, inode);
+	inode->i_ctime = inode->i_mtime = current_time(inode);
+	time = current_time(inode).tv_sec;
+	update.tail = sih->log_tail;
+	update.alter_tail = sih->alter_log_tail;
+
+	/* Return initialized blocks to the user */
+	allocated = nova_new_data_blocks(sb, sih, &blocknr, iblock,
+				 num_blocks, !nozero, ANY_CPU,
+				 ALLOC_FROM_HEAD);
+	if (allocated <= 0) {
+		nova_dbgv("%s alloc blocks failed %d\n", __func__,
+							allocated);
+		ret = allocated;
+		goto out;
+	}
+
+	num_blocks = allocated;
+	/* Do not extend file size */
+	nova_init_file_write_entry(sb, sih, &entry_data,
+					epoch_id, iblock, num_blocks,
+					blocknr, time, inode->i_size);
+
+	ret = nova_append_file_write_entry(sb, pi, inode,
+				&entry_data, &update);
+	if (ret) {
+		nova_dbgv("%s: append inode entry failed\n", __func__);
+		ret = -ENOSPC;
+		goto out;
+	}
+
+	nvmm = blocknr;
+	data_bits = blk_type_to_shift[sih->i_blk_type];
+	sih->i_blocks += (num_blocks << (data_bits - sb->s_blocksize_bits));
+
+	nova_memunlock_inode(sb, pi, &irq_flags);
+	nova_update_inode(sb, inode, pi, &update, 1);
+	nova_memlock_inode(sb, pi, &irq_flags);
+
+	ret = nova_reassign_file_tree(sb, sih, update.curr_entry);
+	if (ret) {
+		nova_dbgv("%s: nova_reassign_file_tree failed: %d\n",
+			  __func__,  ret);
+		goto out;
+	}
+	inode->i_blocks = sih->i_blocks;
+	sih->trans_id++;
+	NOVA_STATS_ADD(dax_new_blocks, 1);
+
+//	set_buffer_new(bh);
+out:
+	if (ret < 0) {
+		nova_cleanup_incomplete_write(sb, sih, blocknr, allocated,
+						0, update.tail);
+		num_blocks = ret;
+		goto out1;
+	}
+
+	*bno = nvmm;
+//	if (num_blocks > 1)
+//		bh->b_size = sb->s_blocksize * num_blocks;
+
+out1:
+	if (taking_lock && locked)
+		inode_unlock(inode);
+
+	NOVA_END_TIMING(dax_get_block_t, get_block_time);
+	return num_blocks;
+}
+
+#endif
 int nova_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 	unsigned int flags, struct iomap *iomap, bool taking_lock)
 {
@@ -1022,12 +1171,21 @@ int nova_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 	u32 bno;
 	int ret;
 
+#ifndef CONFIG_DAXVM
 	ret = nova_dax_get_blocks(inode, first_block, max_blocks, &bno, &new,
 				  &boundary, flags & IOMAP_WRITE, taking_lock);
 	if (ret < 0) {
 		nova_dbgv("%s: nova_dax_get_blocks failed %d", __func__, ret);
 		return ret;
 	}
+#else
+	ret = nova_dax_get_blocks(inode, first_block, max_blocks, &bno, &new,
+				  &boundary, flags & IOMAP_WRITE, ((flags & IOMAP_DAXVM) && !nova_zeroout), taking_lock);
+	if (ret < 0) {
+		nova_dbgv("%s: nova_dax_get_blocks failed %d", __func__, ret);
+		return ret;
+	}
+#endif
 
 	iomap->flags = 0;
 	iomap->bdev = inode->i_sb->s_bdev;
@@ -1067,8 +1225,18 @@ static int nova_iomap_begin_lock(struct inode *inode, loff_t offset,
 	return nova_iomap_begin(inode, offset, length, flags, iomap, true);
 }
 
+#ifdef CONFIG_DAXVM
+static int nova_iomap_daxvm_get_pfn(struct inode *inode, loff_t pos, size_t size, pfn_t *pfnp)
+{
+	return nova_daxvm_get_pfn(inode, pos, size, pfnp);
+}
+#endif
+
 static struct iomap_ops nova_iomap_ops_lock = {
 	.iomap_begin	= nova_iomap_begin_lock,
+#ifdef CONFIG_DAXVM
+	.iomap_daxvm_get_pfn		= nova_iomap_daxvm_get_pfn,
+#endif
 	.iomap_end	= nova_iomap_end,
 };
 
@@ -1082,6 +1250,9 @@ static vm_fault_t nova_dax_huge_fault(struct vm_fault *vmf,
 	INIT_TIMING(fault_time);
 	struct address_space *mapping = vmf->vma->vm_file->f_mapping;
 	struct inode *inode = mapping->host;
+#ifdef CONFIG_DAXVM
+	bool daxvm_set =0 ;
+#endif
 
 	NOVA_START_TIMING(pmd_fault_t, fault_time);
 
@@ -1091,8 +1262,39 @@ static vm_fault_t nova_dax_huge_fault(struct vm_fault *vmf,
 	if (vmf->flags & FAULT_FLAG_WRITE)
 		file_update_time(vmf->vma->vm_file);
 
+#ifdef CONFIG_DAXVM
+	if(vmf->vma->vm_flags & VM_DAXVM){
+	  if(!vmf->flags & FAULT_FLAG_WRITE) {
+		  daxvm_set = nova_daxvm_fault(vmf,inode);
+		  if (daxvm_set){
+        ret = VM_FAULT_NOPAGE;
+        goto daxvm_pte_done;
+      }
+		  ret = dax_iomap_fault(vmf, pe_size, &pfn, &error, &nova_iomap_ops_lock);
+	  }
+	  else{
+		  if(!daxvm_msync_support){
+			  daxvm_set = nova_daxvm_file_mkwrite(vmf);
+			  if (daxvm_set) {
+				  ret = VM_FAULT_NOPAGE; 
+				  goto daxvm_pte_done;
+			  }
+		  }
+		  ret = dax_iomap_fault(vmf, pe_size, &pfn, &error, &nova_iomap_ops_lock);
+      if(pe_size == PE_SIZE_PTE){
+			  daxvm_set = nova_daxvm_fault(vmf,inode);
+        if(daxvm_set)	ret = VM_FAULT_NOPAGE; 
+      }
+	  }
+  }
+  else {
+	  ret = dax_iomap_fault(vmf, pe_size, &pfn, &error, &nova_iomap_ops_lock);
+  }
+#else
 	ret = dax_iomap_fault(vmf, pe_size, &pfn, &error, &nova_iomap_ops_lock);
+#endif
 
+daxvm_pte_done:
 	NOVA_END_TIMING(pmd_fault_t, fault_time);
 	return ret;
 }

@@ -706,6 +706,310 @@ static inline void __vma_unlink_prev(struct mm_struct *mm,
 	__vma_unlink_common(mm, vma, prev, true, vma);
 }
 
+#ifdef CONFIG_DAXVM
+//Batching
+static void unmap_zombie_regions(struct mm_struct *mm,struct vm_area_struct *vma);
+
+static void __zombie_vma_rb_erase(struct vm_area_struct *vma, struct rb_root *root)
+{
+	/*
+	 * Note rb_erase_augmented is a fairly large inline function,
+	 * so make sure we instantiate it only once with our desired
+	 * augmented rbtree callbacks.
+	 */
+	rb_erase_augmented(&vma->zombie_vm_rb, root, &vma_gap_callbacks);
+}
+
+static __always_inline void zombie_vma_rb_erase(struct vm_area_struct *vma,
+					 struct rb_root *root)
+{
+
+	__zombie_vma_rb_erase(vma, root);
+}
+
+int find_zombie_vma_links(struct mm_struct *mm, unsigned long addr,
+		unsigned long end, struct vm_area_struct **pprev,
+		struct rb_node ***rb_link, struct rb_node **rb_parent)
+{
+	struct rb_node **__rb_link, *__rb_parent, *rb_prev;
+
+	__rb_link = &mm->zombie_mm_rb.rb_node;
+	rb_prev = __rb_parent = NULL;
+
+	while (*__rb_link) {
+		struct vm_area_struct *vma_tmp;
+
+		__rb_parent = *__rb_link;
+		vma_tmp = rb_entry(__rb_parent, struct vm_area_struct, zombie_vm_rb);
+
+		if (vma_tmp->vm_end > addr) {
+			/* Fail if an existing vma overlaps the area */
+			if (vma_tmp->vm_start < end)
+				return -ENOMEM;
+			__rb_link = &__rb_parent->rb_left;
+		} else {
+			rb_prev = __rb_parent;
+			__rb_link = &__rb_parent->rb_right;
+		}
+	}
+
+	*pprev = NULL;
+	if (rb_prev)
+		*pprev = rb_entry(rb_prev, struct vm_area_struct, zombie_vm_rb);
+	*rb_link = __rb_link;
+	*rb_parent = __rb_parent;
+	return 0;
+}
+EXPORT_SYMBOL(find_zombie_vma_links);
+
+void __zombie_vma_link_rb(struct mm_struct *mm, struct vm_area_struct *vma,
+		struct rb_node **rb_link, struct rb_node *rb_parent)
+{
+
+	rb_link_node(&vma->zombie_vm_rb, rb_parent, rb_link);
+	rb_insert_color(&vma->zombie_vm_rb, &mm->zombie_mm_rb);
+}
+
+
+void
+__zombie_vma_link(struct mm_struct *mm, struct vm_area_struct *vma,
+	struct vm_area_struct *prev, struct rb_node **rb_link,
+	struct rb_node *rb_parent)
+{
+	__zombie_vma_link_list(mm, vma, prev, rb_parent);
+	__zombie_vma_link_rb(mm, vma, rb_link, rb_parent);
+}
+EXPORT_SYMBOL(__zombie_vma_link);
+
+
+static void __insert_zombie_vm_struct(struct mm_struct *mm, struct vm_area_struct *vma)
+{
+	struct vm_area_struct *prev;
+	struct rb_node **rb_link, *rb_parent;
+
+	if (find_zombie_vma_links(mm, vma->vm_start, vma->vm_end,
+			   &prev, &rb_link, &rb_parent))
+		BUG();
+	__zombie_vma_link(mm, vma, prev, rb_link, rb_parent);
+	mm->zombie_map_count++;
+}
+
+//Ephemeral
+static void __ephemeral_vma_rb_erase(struct vm_area_struct *vma, struct rb_root *root)
+{
+	rb_erase_augmented(&vma->ephemeral_vm_rb, root, &vma_gap_callbacks);
+}
+
+static __always_inline void ephemeral_vma_rb_erase(struct vm_area_struct *vma,
+					 struct rb_root *root)
+{
+	__ephemeral_vma_rb_erase(vma, root);
+}
+
+//Ephemeral Heap (distributed vmas)
+int find_ephemeral_mm_links(struct mm_struct *mm, unsigned long addr,
+		unsigned long end, struct vm_area_struct **pprev,
+		struct rb_node ***rb_link, struct rb_node **rb_parent)
+{
+	struct rb_node **__rb_link, *__rb_parent, *rb_prev;
+
+	__rb_link = &mm->ephemeral_heap_mm_rb.rb_node;
+	rb_prev = __rb_parent = NULL;
+
+	while (*__rb_link) {
+		struct vm_area_struct *vma_tmp;
+
+		__rb_parent = *__rb_link;
+		vma_tmp = rb_entry(__rb_parent, struct vm_area_struct, ephemeral_heap_vm_rb);
+
+		if (vma_tmp->vm_end > addr) {
+			/* Fail if an existing vma overlaps the area */
+			if (vma_tmp->vm_start < end)
+				return -ENOMEM;
+			__rb_link = &__rb_parent->rb_left;
+		} else {
+			rb_prev = __rb_parent;
+			__rb_link = &__rb_parent->rb_right;
+		}
+	}
+
+	*pprev = NULL;
+	if (rb_prev)
+		*pprev = rb_entry(rb_prev, struct vm_area_struct, ephemeral_heap_vm_rb);
+	*rb_link = __rb_link;
+	*rb_parent = __rb_parent;
+	return 0;
+
+}
+EXPORT_SYMBOL(find_ephemeral_mm_links);
+
+void __ephemeral_mm_link_rb(struct mm_struct *mm, struct vm_area_struct *vma,
+		struct rb_node **rb_link, struct rb_node *rb_parent)
+{
+
+	rb_link_node(&vma->ephemeral_heap_vm_rb, rb_parent, rb_link);
+	rb_insert_color(&vma->ephemeral_heap_vm_rb, &mm->ephemeral_heap_mm_rb);
+}
+
+void
+__ephemeral_mm_link(struct mm_struct *mm, struct vm_area_struct *vma,
+	struct vm_area_struct *prev, struct rb_node **rb_link,
+	struct rb_node *rb_parent)
+{
+	__ephemeral_mm_link_list(mm, vma, prev, rb_parent);
+	__ephemeral_mm_link_rb(mm, vma, rb_link, rb_parent);
+}
+EXPORT_SYMBOL(__ephemeral_mm_link);
+
+void __insert_ephemeral_mm_struct(struct mm_struct *mm, struct vm_area_struct *vma)
+{
+	struct vm_area_struct *prev;
+	struct rb_node **rb_link, *rb_parent;
+
+	if (find_ephemeral_mm_links(mm, vma->vm_start, vma->vm_end,
+			   &prev, &rb_link, &rb_parent))
+		BUG();
+	__ephemeral_mm_link(mm, vma, prev, rb_link, rb_parent);
+}
+EXPORT_SYMBOL(__insert_ephemeral_mm_struct);
+
+struct vm_area_struct *find_ephemeral_mm(struct mm_struct *mm, unsigned long addr)
+{
+	struct rb_node *rb_node;
+	struct vm_area_struct *vma;
+
+	rb_node = mm->ephemeral_heap_mm_rb.rb_node;
+
+	while (rb_node) {
+		struct vm_area_struct *tmp;
+
+		tmp = rb_entry(rb_node, struct vm_area_struct, ephemeral_heap_vm_rb);
+
+		if (tmp->vm_end > addr) {
+			vma = tmp;
+			if (tmp->vm_start <= addr)
+				break;
+			rb_node = rb_node->rb_left;
+		} else
+			rb_node = rb_node->rb_right;
+	}
+
+	return vma;
+}
+
+EXPORT_SYMBOL(find_ephemeral_mm);
+
+//Ephemeral vma (inside a distributed ephemeral mm
+int find_ephemeral_vma_links(struct vm_area_struct *mm, unsigned long addr,
+		unsigned long end, struct vm_area_struct **pprev,
+		struct rb_node ***rb_link, struct rb_node **rb_parent)
+{
+	struct rb_node **__rb_link, *__rb_parent, *rb_prev;
+
+	__rb_link = &mm->ephemeral_mm_rb.rb_node;
+	rb_prev = __rb_parent = NULL;
+
+	while (*__rb_link) {
+		struct vm_area_struct *vma_tmp;
+
+		__rb_parent = *__rb_link;
+		vma_tmp = rb_entry(__rb_parent, struct vm_area_struct, ephemeral_vm_rb);
+
+		if (vma_tmp->vm_end > addr) {
+			/* Fail if an existing vma overlaps the area */
+			if (vma_tmp->vm_start < end){
+				return -ENOMEM;
+			}
+			__rb_link = &__rb_parent->rb_left;
+		} else {
+			rb_prev = __rb_parent;
+			__rb_link = &__rb_parent->rb_right;
+		}
+	}
+
+	*pprev = NULL;
+	if (rb_prev)
+		*pprev = rb_entry(rb_prev, struct vm_area_struct, ephemeral_vm_rb);
+	*rb_link = __rb_link;
+	*rb_parent = __rb_parent;
+	return 0;
+
+}
+EXPORT_SYMBOL(find_ephemeral_vma_links);
+
+void __ephemeral_vma_link_rb(struct vm_area_struct *mm, struct vm_area_struct *vma,
+		struct rb_node **rb_link, struct rb_node *rb_parent)
+{
+
+	rb_link_node(&vma->ephemeral_vm_rb, rb_parent, rb_link);
+	rb_insert_color(&vma->ephemeral_vm_rb, &mm->ephemeral_mm_rb);
+}
+
+void
+__ephemeral_vma_link(struct vm_area_struct *mm, struct vm_area_struct *vma,
+	struct vm_area_struct *prev, struct rb_node **rb_link,
+	struct rb_node *rb_parent)
+{
+	__ephemeral_vma_link_list(mm, vma, prev, rb_parent);
+	__ephemeral_vma_link_rb(mm, vma, rb_link, rb_parent);
+}
+EXPORT_SYMBOL(__ephemeral_vma_link);
+
+static void vma_link_ephemeral(struct vm_area_struct *mm, struct vm_area_struct *vma,
+			struct vm_area_struct *prev, struct rb_node **rb_link,
+			struct rb_node *rb_parent)
+{
+	struct address_space *mapping = NULL;
+
+	if (vma->vm_file) {
+		mapping = vma->vm_file->f_mapping;
+		i_mmap_lock_write(mapping);
+	}
+	else BUG();
+
+	spin_lock(&mm->ephemeral_lock);
+	if (find_ephemeral_vma_links(mm, vma->vm_start, vma->vm_end, &prev, &rb_link, &rb_parent)) BUG();
+	__ephemeral_vma_link(mm, vma, prev, rb_link, rb_parent);	
+	spin_unlock(&mm->ephemeral_lock);
+	
+	__vma_link_file(vma);
+
+	if (mapping)
+		i_mmap_unlock_write(mapping);
+
+	atomic_inc(&mm->ephemeral_mm_users);	
+}
+
+/* Look up the first VMA which satisfies  addr < vm_end,  NULL if none. */
+struct vm_area_struct *find_ephemeral_vma(struct vm_area_struct *mm, unsigned long addr)
+{
+	struct rb_node *rb_node;
+	struct vm_area_struct *vma;
+
+	rb_node = mm->ephemeral_mm_rb.rb_node;
+
+	while (rb_node) {
+		struct vm_area_struct *tmp;
+
+		tmp = rb_entry(rb_node, struct vm_area_struct, ephemeral_vm_rb);
+
+		if (tmp->vm_end > addr) {
+			vma = tmp;
+			if (tmp->vm_start <= addr)
+				break;
+			rb_node = rb_node->rb_left;
+		} else
+			rb_node = rb_node->rb_right;
+	}
+
+	if(vma && (vma->vm_start > addr))
+		BUG();
+	return vma;
+}
+
+EXPORT_SYMBOL(find_ephemeral_vma);
+#endif
+
 /*
  * We cannot adjust vm_start, vm_end, vm_pgoff fields of a vma that
  * is already present in an i_mmap tree without adjusting the tree.
@@ -1379,6 +1683,206 @@ static inline bool file_mmap_ok(struct file *file, struct inode *inode,
 	return true;
 }
 
+#ifdef CONFIG_DAXVM
+unsigned long mmap_region_ephemeral(struct file *file, unsigned long addr,
+		unsigned long len, vm_flags_t vm_flags, unsigned long pgoff,
+		struct list_head *uf)
+{
+	struct mm_struct *mm = current->mm;
+	struct vm_area_struct *vma, *prev;
+	int error;
+	struct rb_node **rb_link, *rb_parent;
+	unsigned long charged = 0;
+
+	vma = vm_area_alloc(mm);
+	if (!vma) {
+		error = -ENOMEM;
+		goto unacct_error;
+	}
+
+	vma->vm_start = addr;
+	vma->vm_end = addr + len;
+	vma->vm_flags = vm_flags;
+	vma->vm_page_prot = vm_get_page_prot(vm_flags);
+	vma->vm_pgoff = pgoff;
+
+	if(!file) BUG();
+	
+	if (vm_flags & VM_DENYWRITE) {
+		error = deny_write_access(file);
+		if (error)
+			goto free_vma;
+	}
+	
+	if (vm_flags & VM_SHARED) {
+		error = mapping_map_writable(file->f_mapping);
+		if (error)
+			goto allow_write_and_free_vma;
+	}
+
+	vma->vm_file = get_file(file);
+	error = call_mmap(file, vma);
+	if (error)
+		goto unmap_and_free_vma;
+
+	WARN_ON_ONCE(addr != vma->vm_start);
+
+	addr = vma->vm_start;
+	vm_flags = vma->vm_flags;
+
+	vma_link_ephemeral(mm->eheap, vma, prev, rb_link, rb_parent);
+
+	/* Once vma denies write, undo our temporary denial count */
+	if (file) {
+		if (vm_flags & VM_SHARED)
+			mapping_unmap_writable(file->f_mapping);
+		if (vm_flags & VM_DENYWRITE)
+			allow_write_access(file);
+	}
+	file = vma->vm_file;
+out:
+	perf_event_mmap(vma);
+
+	//vm_stat_account(mm, vm_flags, len >> PAGE_SHIFT);
+	if (vm_flags & VM_LOCKED) {
+		if ((vm_flags & VM_SPECIAL) || vma_is_dax(vma) ||
+					is_vm_hugetlb_page(vma) ||
+					vma == get_gate_vma(current->mm))
+			vma->vm_flags &= VM_LOCKED_CLEAR_MASK;
+		else
+			mm->locked_vm += (len >> PAGE_SHIFT);
+	}
+
+	if (file)
+		uprobe_mmap(vma);
+
+	/*
+	 * New (or expanded) vma always get soft dirty status.
+	 * Otherwise user-space soft-dirty page tracker won't
+	 * be able to distinguish situation when vma area unmapped,
+	 * then new mapped in-place (which must be aimed as
+	 * a completely new data area).
+	 */
+	vma->vm_flags |= VM_SOFTDIRTY;
+
+	vma_set_page_prot(vma);
+
+	
+	return addr;
+
+unmap_and_free_vma:
+
+	vma->vm_file = NULL;
+	fput(file);
+
+	/* Undo any partial mapping done by a device driver. */
+	unmap_region(mm, vma, prev, vma->vm_start, vma->vm_end);
+	charged = 0;
+	if (vm_flags & VM_SHARED)
+		mapping_unmap_writable(file->f_mapping);
+allow_write_and_free_vma:
+	if (vm_flags & VM_DENYWRITE)
+		allow_write_access(file);
+free_vma:
+	vm_area_free(vma);
+unacct_error:
+	if (charged)
+		vm_unacct_memory(charged);
+	return error;
+}
+
+unsigned long do_mmap_ephemeral(struct file *file, unsigned long addr,
+			unsigned long len, unsigned long prot,
+			unsigned long flags, vm_flags_t vm_flags,
+			unsigned long pgoff, unsigned long *populate,
+			struct list_head *uf)
+{
+	struct mm_struct *mm = current->mm;
+	int pkey = 0;
+
+	if (!len)
+		return -EINVAL;
+
+	len = PAGE_ALIGN(len);
+	if (!len)
+		return -ENOMEM;
+
+	if ((pgoff + (len >> PAGE_SHIFT)) < pgoff)
+		return -EOVERFLOW;
+
+	if (mm->map_count > sysctl_max_map_count)
+		return -ENOMEM;
+
+	unsigned long original_pgoff = pgoff;
+	len = round_up(len+((pgoff-round_down(pgoff, PMD_SIZE>>PAGE_SHIFT))<<PAGE_SHIFT),PMD_SIZE);
+	pgoff = round_down(pgoff, PMD_SIZE>>PAGE_SHIFT);
+
+	addr = get_unmapped_area_ephemeral(file, addr, len, pgoff, flags);
+
+	if (offset_in_page(addr))
+		return addr;
+
+	if (prot == PROT_EXEC) {
+		pkey = execute_only_pkey(mm);
+		if (pkey < 0)
+			pkey = 0;
+	}
+
+	vm_flags |= calc_vm_prot_bits(prot, pkey) | calc_vm_flag_bits(flags) |
+			mm->def_flags | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC;
+
+  vm_flags |= VM_DAXVM;
+  vm_flags |= VM_DAXVM_EPHEMERAL;
+
+ 
+	if (flags & MAP_DAXVM_BATCHING){
+		vm_flags |= VM_DAXVM_BATCHING; 
+	}
+
+
+	if(!file) BUG();
+
+	struct inode *inode = file_inode(file);
+	unsigned long flags_mask;
+
+	if (!file_mmap_ok(file, inode, pgoff, len))
+		return -EOVERFLOW;
+
+	flags_mask = LEGACY_MAP_MASK | file->f_op->mmap_supported_flags;
+
+	switch (flags & MAP_TYPE) {
+	
+	case MAP_SHARED:
+		flags &= LEGACY_MAP_MASK;
+	
+	case MAP_SHARED_VALIDATE:
+		if (flags & ~flags_mask)
+			return -EOPNOTSUPP;
+		
+		if ((prot&PROT_WRITE) && !(file->f_mode&FMODE_WRITE))
+			return -EACCES;
+		
+		if (IS_APPEND(inode) && (file->f_mode & FMODE_WRITE))
+			return -EACCES;
+
+		if (locks_verify_locked(file))
+			return -EAGAIN;
+
+		vm_flags |= VM_SHARED | VM_MAYSHARE;
+		if (!(file->f_mode & FMODE_WRITE))
+			vm_flags &= ~(VM_MAYWRITE | VM_SHARED);
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	addr = mmap_region_ephemeral(file, addr, len, vm_flags, pgoff, uf);
+	
+	addr += ((original_pgoff<<PAGE_SHIFT) - addr) & (PMD_SIZE - 1);
+	return addr;
+}
+#endif
+
 /*
  * The caller must hold down_write(&current->mm->mmap_sem).
  */
@@ -1390,6 +1894,9 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 {
 	struct mm_struct *mm = current->mm;
 	int pkey = 0;
+#ifdef CONFIG_DAXVM
+	unsigned long original_pgoff;
+#endif
 
 	*populate = 0;
 
@@ -1426,10 +1933,19 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 	if (mm->map_count > sysctl_max_map_count)
 		return -ENOMEM;
 
+#ifdef CONFIG_DAXVM
+	original_pgoff = pgoff;
+	if(flags & MAP_DAXVM) {
+		len = round_up(len+((pgoff-round_down(pgoff, PMD_SIZE>>PAGE_SHIFT))<<PAGE_SHIFT),PMD_SIZE);
+		pgoff = round_down(pgoff, PMD_SIZE>>PAGE_SHIFT);
+	}
+#endif
+
 	/* Obtain the address to map to. we verify (or select) it and ensure
 	 * that it represents a valid section of the address space.
 	 */
 	addr = get_unmapped_area(file, addr, len, pgoff, flags);
+
 	if (offset_in_page(addr))
 		return addr;
 
@@ -1452,6 +1968,15 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 	 */
 	vm_flags |= calc_vm_prot_bits(prot, pkey) | calc_vm_flag_bits(flags) |
 			mm->def_flags | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC;
+
+#ifdef CONFIG_DAXVM
+	if (flags & MAP_DAXVM){
+		vm_flags |= VM_DAXVM; 
+	  if (flags & MAP_DAXVM_BATCHING){
+		  vm_flags |= VM_DAXVM_BATCHING; 
+	  }
+	}
+#endif
 
 	if (flags & MAP_LOCKED)
 		if (!can_do_mlock())
@@ -1522,7 +2047,13 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 		default:
 			return -EINVAL;
 		}
-	} else {
+	} 
+#ifdef CONFIG_DAXVM  
+  else if (flags & MAP_DAXVM_EPHEMERAL_HEAP) {
+		vm_flags = VM_READ | VM_WRITE | VM_DAXVM_EPHEMERAL_HEAP | VM_SPECIAL;
+	} 
+#endif  
+  else {
 		switch (flags & MAP_TYPE) {
 		case MAP_SHARED:
 			if (vm_flags & (VM_GROWSDOWN|VM_GROWSUP))
@@ -1559,10 +2090,18 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 	}
 
 	addr = mmap_region(file, addr, len, vm_flags, pgoff, uf);
+
 	if (!IS_ERR_VALUE(addr) &&
 	    ((vm_flags & VM_LOCKED) ||
 	     (flags & (MAP_POPULATE | MAP_NONBLOCK)) == MAP_POPULATE))
 		*populate = len;
+
+#ifdef CONFIG_DAXVM
+	if (vm_flags & VM_DAXVM){
+		addr += ((original_pgoff<<PAGE_SHIFT) - addr) & (PMD_SIZE - 1);
+	}
+#endif
+
 	return addr;
 }
 
@@ -1607,6 +2146,17 @@ unsigned long ksys_mmap_pgoff(unsigned long addr, unsigned long len,
 	}
 
 	flags &= ~(MAP_EXECUTABLE | MAP_DENYWRITE);
+
+#ifdef CONFIG_DAXVM
+	if(flags & MAP_DAXVM_EPHEMERAL && len<fast_mapping_vma_size){
+
+  		retval = vm_mmap_pgoff_ephemeral(file, addr, len, prot, flags, pgoff);
+  		if(retval) goto out_fput;
+  	
+      flags = MAP_SHARED|MAP_DAXVM;
+	}
+#endif
+
 
 	retval = vm_mmap_pgoff(file, addr, len, prot, flags, pgoff);
 out_fput:
@@ -2198,7 +2748,15 @@ get_unmapped_area(struct file *file, unsigned long addr, unsigned long len,
 	if (file) {
 		if (file->f_op->get_unmapped_area)
 			get_area = file->f_op->get_unmapped_area;
-	} else if (flags & MAP_SHARED) {
+	}
+
+#ifdef CONFIG_DAXVM
+  else if (flags & MAP_DAXVM_EPHEMERAL_HEAP) {
+			get_area = daxvm_ephemeral_thp_get_unmapped_area;
+  }
+#endif    
+
+  else if (flags & MAP_SHARED) {
 		/*
 		 * mmap_region() will call shmem_zero_setup() to create a file,
 		 * so use shmem's get_unmapped_area in case it can be huge.
@@ -2222,6 +2780,42 @@ get_unmapped_area(struct file *file, unsigned long addr, unsigned long len,
 }
 
 EXPORT_SYMBOL(get_unmapped_area);
+
+#ifdef CONFIG_DAXVM
+unsigned long get_unmapped_area_ephemeral(struct file *file, unsigned long addr, unsigned long len, unsigned long pgoff, unsigned long flags)
+{
+
+	unsigned long error;
+
+	if (addr)
+  		return -EOPNOTSUPP;
+
+	/* Careful about overflows.. */
+	if (len > TASK_SIZE)
+		return -ENOMEM;
+
+	//Rounding to attachment level!
+	len = round_up(len+((pgoff-round_down(pgoff, PMD_SIZE>>PAGE_SHIFT))<<PAGE_SHIFT),PMD_SIZE);
+	pgoff = round_down(pgoff, PMD_SIZE>>PAGE_SHIFT);
+
+	//Should these two operations get locks or atomic is sufficient?
+	//currently no locks!
+	addr = atomic64_fetch_add(len, &current->mm->eheap->heap_base);
+
+	if (IS_ERR_VALUE(addr))
+  		return addr;
+
+	if (addr > TASK_SIZE - len)
+  		return -ENOMEM;
+
+	if (offset_in_page(addr))
+  		return -EINVAL;
+
+	error = security_mmap_addr(addr);
+	return error ? error : addr;
+}
+EXPORT_SYMBOL(get_unmapped_area_ephemeral);
+#endif
 
 /* Look up the first VMA which satisfies  addr < vm_end,  NULL if none. */
 struct vm_area_struct *find_vma(struct mm_struct *mm, unsigned long addr)
@@ -2644,6 +3238,203 @@ detach_vmas_to_be_unmapped(struct mm_struct *mm, struct vm_area_struct *vma,
 	vmacache_invalidate(mm);
 }
 
+#ifdef CONFIG_DAXVM
+static void unmap_zombie_regions(struct mm_struct *mm,
+		struct vm_area_struct *vma)
+{
+	struct vm_area_struct *head, *tail;
+	struct mmu_gather tlb;
+	unsigned long start, end;
+
+	lru_add_drain();
+	tlb_gather_mmu(&tlb, mm, 0, -1);
+	update_hiwater_rss(mm);
+	
+	while(vma){
+		head = vma;
+		tail = vma;
+		
+		while(vma && (head->zombie_vm_end==vma->zombie_vm_end)) {
+			tail = vma;
+			vma=vma->zombie_vm_next;
+		}
+		unmap_zombie_vmas(&tlb, head, head->vm_start, tail->vm_end);
+		free_pgtables(&tlb, head, head->zombie_vm_start ? head->zombie_vm_start : FIRST_USER_ADDRESS,
+					tail->zombie_vm_end ? tail->zombie_vm_end : USER_PGTABLES_CEILING);
+	}
+	tlb_finish_mmu(&tlb, 0, -1);
+}
+
+static void
+detach_zombie_vmas_to_be_unmapped(struct mm_struct *mm)
+{
+	struct vm_area_struct **insertion_point;
+	struct vm_area_struct *vma = NULL;
+
+	insertion_point = &mm->zombie_mmap;
+	vma = mm->zombie_mmap;
+	vma->zombie_vm_prev = NULL;
+	do {
+	
+		if(vma->vm_next)
+			vma->zombie_vm_end = vma->vm_next->vm_start;
+		if(vma->vm_prev)
+			vma->zombie_vm_start = vma->vm_prev->vm_end;
+		
+		detach_vmas_to_be_unmapped(mm, vma, vma->vm_prev, vma->vm_end);
+
+		zombie_vma_rb_erase(vma, &mm->zombie_mm_rb);
+		mm->zombie_map_count--;
+
+		vma = vma->zombie_vm_next;
+
+	} while (vma);
+
+	*insertion_point = vma;
+	
+	if(vma) BUG();	
+}
+//Ephemeral
+static void unmap_region_ephemeral(struct vm_area_struct *mm,
+		struct vm_area_struct *vma, struct vm_area_struct *prev, struct vm_area_struct *next,
+		unsigned long start, unsigned long end)
+{
+	struct mmu_gather tlb;
+
+	lru_add_drain();
+	tlb_gather_mmu(&tlb, mm->vm_mm, start, end);
+
+	unmap_ephemeral_vmas(&tlb, vma, start, end);
+	free_pgtables(&tlb, vma, prev ? prev->vm_end : FIRST_USER_ADDRESS,
+				 next ? next->vm_start : USER_PGTABLES_CEILING);
+	tlb_finish_mmu(&tlb, start, end);
+}
+
+static void
+detach_ephemeral_vmas_to_be_unmapped(struct vm_area_struct *mm, struct vm_area_struct *vma,
+	struct vm_area_struct *prev, unsigned long end)
+{
+	struct vm_area_struct **insertion_point;
+	struct vm_area_struct *tail_vma = NULL;
+
+	insertion_point = (prev ? &prev->ephemeral_vm_next : &mm->ephemeral_mmap);
+	vma->ephemeral_vm_prev = NULL;
+	do {
+		ephemeral_vma_rb_erase(vma, &mm->ephemeral_mm_rb);
+		atomic_dec(&mm->ephemeral_mm_users);	
+		tail_vma = vma;
+		vma = vma->ephemeral_vm_next;
+	} while (vma && vma->vm_start < end);
+
+	*insertion_point = vma;
+
+	if (vma) {
+		vma->ephemeral_vm_prev = prev;
+	} 
+
+	tail_vma->ephemeral_vm_next = NULL;
+}
+
+static struct vm_area_struct *remove_ephemeral_vma(struct vm_area_struct *vma)
+{
+	struct vm_area_struct *next = vma->ephemeral_vm_next;
+
+	might_sleep();
+	if (vma->vm_ops && vma->vm_ops->close)
+		vma->vm_ops->close(vma);
+	if (vma->vm_file)
+		fput(vma->vm_file);
+	mpol_put(vma_policy(vma));
+	
+	vm_area_free(vma);
+	return next;
+}
+
+static void remove_ephemeral_vma_list(struct vm_area_struct *vma)
+{
+
+	do {
+		vma = remove_ephemeral_vma(vma);
+	} while (vma);
+}
+
+//Ephemeral zombie
+static void
+detach_ephemeral_zombie_vmas_to_be_unmapped(struct mm_struct * mm)
+{
+	struct vm_area_struct **insertion_point;
+	struct vm_area_struct *vma = NULL;
+
+	struct vm_area_struct *ephemeral_mm = NULL;
+	struct vm_area_struct *ephemeral_prev, *ephemeral_next, *prev, *next;
+
+	insertion_point = &mm->zombie_mmap;
+	vma = mm->zombie_mmap;
+	BUG_ON(!vma);
+	vma->zombie_vm_prev = NULL;
+	do {
+	
+
+		ephemeral_mm = find_ephemeral_mm(mm, vma->vm_start);
+
+		spin_lock(&ephemeral_mm->ephemeral_lock);
+		
+		ephemeral_prev = vma->ephemeral_vm_prev;
+		ephemeral_next = ephemeral_prev ? ephemeral_prev->ephemeral_vm_next : ephemeral_mm;
+		
+		prev = ephemeral_mm->vm_prev;
+		next = prev ? prev->vm_next : mm->mmap;
+		
+		if (!ephemeral_prev) ephemeral_prev = prev;
+		if (!ephemeral_next) ephemeral_prev = next;
+
+		if(ephemeral_next)
+			vma->zombie_vm_end = ephemeral_next->vm_start;
+		if(ephemeral_prev)
+			vma->zombie_vm_start = ephemeral_prev->vm_end;
+
+		detach_ephemeral_vmas_to_be_unmapped(ephemeral_mm, vma, ephemeral_prev, vma->vm_end);
+		spin_unlock(&ephemeral_mm->ephemeral_lock);
+
+		zombie_vma_rb_erase(vma, &mm->zombie_mm_rb);
+		mm->zombie_map_count--;
+
+		vma = vma->zombie_vm_next;
+
+	} while (vma);
+
+	*insertion_point = vma;
+	
+	if(vma) BUG();	
+}
+
+static void unmap_ephemeral_zombie_regions(struct mm_struct *mm,
+		struct vm_area_struct *vma)
+{
+	struct vm_area_struct *head, *tail;
+	struct mmu_gather tlb;
+	unsigned long start, end;
+
+	lru_add_drain();
+	tlb_gather_mmu(&tlb, mm, 0, -1);
+	
+	while(vma){
+		head = vma;
+		tail = vma;
+		
+		while(vma && (head->zombie_vm_end==vma->zombie_vm_end)) {
+			tail = vma;
+			vma=vma->zombie_vm_next;
+		}
+
+		unmap_zombie_vmas(&tlb, head, head->vm_start, tail->vm_end);
+		free_pgtables(&tlb, head, head->zombie_vm_start ? head->zombie_vm_start : FIRST_USER_ADDRESS,
+					tail->zombie_vm_end ? tail->zombie_vm_end : USER_PGTABLES_CEILING);
+	}
+	tlb_finish_mmu(&tlb, 0, -1);
+}
+#endif
+
 /*
  * __split_vma() bypasses sysctl_max_map_count checking.  We use this where it
  * has already been checked or doesn't make sense to fail.
@@ -2721,6 +3512,114 @@ int split_vma(struct mm_struct *mm, struct vm_area_struct *vma,
 	return __split_vma(mm, vma, addr, new_below);
 }
 
+#ifdef CONFIG_DAXVM
+int __do_munmap_ephemeral(struct mm_struct *mm, unsigned long start, size_t len,
+		struct list_head *uf, bool downgrade)
+{
+	unsigned long end;
+	unsigned long shootdown_len;
+	struct vm_area_struct *ephemeral_mm;
+	struct vm_area_struct *ephemeral_vma, *ephemeral_prev, *ephemeral_next;
+	struct vm_area_struct *prev, *next;
+
+	if ((offset_in_page(start)) || start > TASK_SIZE || len > TASK_SIZE-start)
+		return -EINVAL;
+
+	len = PAGE_ALIGN(len);
+	if (len == 0)
+		return -EINVAL;
+
+	shootdown_len = len;
+	start = round_down(start, PMD_SIZE);
+  len = round_up(len+(start-round_down(start, PMD_SIZE)),PMD_SIZE);
+	end = start + len;
+
+	ephemeral_mm = find_ephemeral_mm(mm,start);
+  if(!ephemeral_mm) {
+   ephemeral_mm = mm->ephemeral_heap_mmap;
+   while(ephemeral_mm) {
+    if(start>=ephemeral_mm->vm_start && end < ephemeral_mm->vm_end) break;
+    ephemeral_mm = ephemeral_mm->ephemeral_heap_vm_next;
+   }
+  }
+	BUG_ON(!ephemeral_mm);
+  //if ((start < ephemeral_mm->vm_start) || (end > ephemeral_mm->vm_end))
+  //  pr_crit("0x%llx-0x%llx 0x%llx-0x%llx\n", ephemeral_mm->vm_start, ephemeral_mm->vm_end, start, end);
+  BUG_ON(start < ephemeral_mm->vm_start);
+  BUG_ON(end > ephemeral_mm->vm_end);
+	
+	spin_lock(&ephemeral_mm->ephemeral_lock);
+	ephemeral_vma = find_ephemeral_vma(ephemeral_mm, start);	
+	spin_unlock(&ephemeral_mm->ephemeral_lock);
+  if(!ephemeral_vma) {
+   ephemeral_vma = ephemeral_mm->ephemeral_mmap;
+   while(ephemeral_vma) {
+    if(start>=ephemeral_vma->vm_start && end < ephemeral_vma->vm_end) break;
+    ephemeral_vma = ephemeral_vma->ephemeral_vm_next;
+   }
+  }
+	BUG_ON(!ephemeral_vma);
+
+
+	if (ephemeral_vma->vm_flags & VM_DAXVM_BATCHING) {
+		bool defer=0;
+		if (cpumask_any_but(mm_cpumask(mm), smp_processor_id()) < nr_cpu_ids)
+			defer=1;
+
+		if(defer) {
+			
+			spin_lock(&mm->ephemeral_zombie_lock);	
+			__insert_zombie_vm_struct(mm,ephemeral_vma);	
+			//spin_unlock(&mm->ephemeral_zombie_lock);	
+			
+			if (atomic_add_return(shootdown_len>>PAGE_SHIFT, &mm->zombie_total_pages) < sysctl_max_zombie_pages){
+				spin_unlock(&mm->ephemeral_zombie_lock);	
+				goto out;
+			}
+		
+			//spin_lock(&mm->ephemeral_zombie_lock);	
+			struct vm_area_struct *zombie = mm->zombie_mmap;
+			BUG_ON(!zombie);
+			detach_ephemeral_zombie_vmas_to_be_unmapped(mm);
+			spin_unlock(&mm->ephemeral_zombie_lock);	
+			
+			unmap_ephemeral_zombie_regions(mm, zombie);
+
+			struct vm_area_struct *zombie_next=zombie;
+			do {
+				zombie_next = zombie->zombie_vm_next;
+				remove_ephemeral_vma_list(zombie);
+				zombie = zombie_next;
+			} while(zombie);
+
+			atomic_set(&mm->zombie_total_pages,0);
+			goto out;	
+		}
+	}
+
+	spin_lock(&ephemeral_mm->ephemeral_lock);
+	ephemeral_prev = ephemeral_vma->ephemeral_vm_prev;
+	ephemeral_next = ephemeral_prev ? ephemeral_prev->ephemeral_vm_next : ephemeral_mm;
+	prev = ephemeral_mm->vm_prev;
+	next = prev ? prev->vm_next : mm->mmap;
+	if (!ephemeral_prev) ephemeral_prev = prev;
+	if (!ephemeral_next) ephemeral_prev = next;
+
+	detach_ephemeral_vmas_to_be_unmapped(ephemeral_mm, ephemeral_vma, ephemeral_prev, end);
+	spin_unlock(&ephemeral_mm->ephemeral_lock);
+	
+	unmap_region_ephemeral(ephemeral_mm, ephemeral_vma, ephemeral_prev, ephemeral_next, start, end);
+
+	/* Fix up all other VM information */
+	remove_ephemeral_vma_list(ephemeral_vma);
+
+
+out:
+	return 0;
+
+}
+#endif
+
 /* Munmap is split into 2 main parts -- this part which finds
  * what needs doing, and the areas themselves, which do the
  * work.  This now handles partial unmappings.
@@ -2731,6 +3630,10 @@ int __do_munmap(struct mm_struct *mm, unsigned long start, size_t len,
 {
 	unsigned long end;
 	struct vm_area_struct *vma, *prev, *last;
+#ifdef CONFIG_DAXVM	
+	unsigned long daxvm_shootdown_start=0;
+	unsigned long daxvm_shootdown_len=0;
+#endif
 
 	if ((offset_in_page(start)) || start > TASK_SIZE || len > TASK_SIZE-start)
 		return -EINVAL;
@@ -2745,6 +3648,22 @@ int __do_munmap(struct mm_struct *mm, unsigned long start, size_t len,
 		return 0;
 	prev = vma->vm_prev;
 	/* we have  start < vma->vm_end  */
+
+#ifdef CONFIG_DAXVM	
+	if(vma->vm_flags & VM_DAXVM){
+	      daxvm_shootdown_len = len;
+	      daxvm_shootdown_start = start;
+    		start = round_down(start, PMD_SIZE);
+    		len = round_up(len+(start-round_down(start, PMD_SIZE)),PMD_SIZE);
+	}
+	if(vma->vm_flags & VM_DAXVM_EPHEMERAL_HEAP || vma->vm_flags & VM_DAXVM_EPHEMERAL){
+    pr_crit("Oops!\n");
+	  downgrade_write(&mm->mmap_sem);
+		__do_munmap_ephemeral(mm, start, len, uf, downgrade);
+    return 1;
+    //BUG();
+  }
+#endif
 
 	/* if it doesn't overlap, we have nothing.. */
 	end = start + len;
@@ -2814,9 +3733,67 @@ int __do_munmap(struct mm_struct *mm, unsigned long start, size_t len,
 		}
 	}
 
+#ifdef CONFIG_DAXVM
+	if(!(vma->vm_flags & VM_DAXVM_BATCHING)) 
+		atomic_set(&mm->daxvm_munmap_inprogress, 0);
+
+	if(atomic_read(&mm->daxvm_munmap_inprogress)){
+	
+    //defer flush only if it involves shootdowns (running on other cores)
+		bool defer=0;
+		if (cpumask_any_but(mm_cpumask(mm), smp_processor_id()) < nr_cpu_ids)
+			defer=1;
+	
+		if(defer){
+		
+			__insert_zombie_vm_struct(mm,vma);	
+
+			//until batch limit do no unmapping
+			if (atomic_add_return(daxvm_shootdown_len>>PAGE_SHIFT, &mm->zombie_total_pages) < sysctl_max_zombie_pages){
+				downgrade=0;
+				goto out;
+			}
+
+			//otherwise perform batched unmapping (all zombies)
+			struct vm_area_struct *zombie = mm->zombie_mmap;
+			detach_zombie_vmas_to_be_unmapped(mm);	
+
+			//MPX currently not supported by DaxVM
+			//arch_unmap(mm, vma, start, end);
+			
+			if (downgrade)
+				downgrade_write(&mm->mmap_sem);
+
+			unmap_zombie_regions(mm, zombie);
+			
+
+			struct vm_area_struct *zombie_next=zombie;
+			do {
+				zombie_next = zombie->zombie_vm_next;
+				remove_vma_list(mm,zombie);
+				zombie = zombie_next;
+			} while(zombie);
+
+			atomic_set(&mm->zombie_total_pages,0);
+			goto out;	
+		}	
+	}
+#endif
+
+
 	/* Detach vmas from rbtree */
 	detach_vmas_to_be_unmapped(mm, vma, prev, end);
 
+/*
+ * FIXME add a tag
+  if(vma->vm_flags & VM_DAXVM) {
+	  if(vma->vm_flags&VM_DAXVM_BATCHING){
+		  //return -EINTR;
+	    zombie_vma_rb_erase(vma, &mm->zombie_mm_rb);
+	    mm->zombie_map_count--;
+    }
+  }
+*/
 	/*
 	 * mpx unmap needs to be called with mmap_sem held for write.
 	 * It is safe to call it before unmap_region().
@@ -2826,11 +3803,22 @@ int __do_munmap(struct mm_struct *mm, unsigned long start, size_t len,
 	if (downgrade)
 		downgrade_write(&mm->mmap_sem);
 
+#ifdef CONFIG_DAXVM
+  if(vma->vm_flags & VM_DAXVM) {
+	  if(vma->vm_flags&VM_DAXVM_BATCHING)
+		  unmap_region(mm, vma, prev, start, end);
+	  else
+	    unmap_region(mm, vma, prev, daxvm_shootdown_start, daxvm_shootdown_start+daxvm_shootdown_len);
+  }
+  else
+	  unmap_region(mm, vma, prev, start, end);
+#else
 	unmap_region(mm, vma, prev, start, end);
-
+#endif
 	/* Fix up all other VM information */
 	remove_vma_list(mm, vma);
 
+out:
 	return downgrade ? 1 : 0;
 }
 
@@ -2846,10 +3834,50 @@ static int __vm_munmap(unsigned long start, size_t len, bool downgrade)
 	struct mm_struct *mm = current->mm;
 	LIST_HEAD(uf);
 
+#ifdef CONFIG_DAXVM
+  pgd_t *pgd=NULL;
+	p4d_t *p4d=NULL;
+  pud_t *pud=NULL;
+  pmd_t *pmd=NULL;
+  bool ephemeral=0;
+ 
+  local_irq_disable();
+  pgd = pgd_offset_pgd(mm->pgd,start);
+  if(pgd && !pgd_none(*pgd))
+    p4d = p4d_offset(pgd, start);
+  if(p4d && !p4d_none(*p4d))
+    pud = pud_offset(p4d, start);
+  if(pud && !pud_none(*pud))
+    pmd = pmd_offset(pud, start);
+  if(pmd && !pmd_none(*pmd) && (is_pmd_daxvm(*pmd) || pmd_devmap(*pmd))){
+    ephemeral = is_pmd_daxvm_ephemeral(*pmd);
+    if(pmd_devmap(*pmd) && ephemeral) pr_crit("Found unmap ephemeral huge page!\n");
+  }
+  local_irq_enable();
+
+	if(ephemeral){
+		down_read(&mm->mmap_sem);
+		ret = __do_munmap_ephemeral(mm, start, len, &uf, downgrade);
+		up_read(&mm->mmap_sem);
+    if (ret) goto default_munmap;
+		return 0;
+	}
+
+default_munmap: 
+#endif
+
 	if (down_write_killable(&mm->mmap_sem))
 		return -EINTR;
 
+#ifdef CONFIG_DAXVM
+	atomic_set(&mm->daxvm_munmap_inprogress, 1);
+#endif
+
 	ret = __do_munmap(mm, start, len, &uf, downgrade);
+
+#ifdef CONFIG_DAXVM
+	atomic_set(&mm->daxvm_munmap_inprogress, 0);
+#endif
 	/*
 	 * Returning 1 indicates mmap_sem is downgraded.
 	 * But 1 is not legal return value of vm_munmap() and munmap(), reset

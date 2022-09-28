@@ -495,6 +495,181 @@ static const struct file_operations nova_seq_gc_fops = {
 	.release	= single_release,
 };
 
+
+#ifdef CONFIG_DAXVM
+#include "./daxvm/daxvm.h"
+ssize_t nova_seq_ppt(struct file *filp, const char __user *buf, size_t len, loff_t *ppos)
+{
+  char *_buf;
+	int retval = len;
+
+	_buf = kmalloc(len, GFP_KERNEL);
+	if (_buf == NULL)  {
+		retval = -ENOMEM;
+		goto out;
+	}
+	if (copy_from_user(_buf, buf, len)) {
+		retval = -EFAULT;
+		goto out;
+	}
+	_buf[len] = 0;
+	sscanf(_buf, "%i", &nova_persistent_page_tables);
+out:
+  return retval;
+}
+
+static int nova_seq_ppt_show(struct seq_file *seq, void *v)
+{
+	seq_printf(seq, "%i\n", nova_persistent_page_tables);
+	return 0;
+}
+
+static int nova_seq_ppt_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, nova_seq_ppt_show, PDE_DATA(inode));
+}
+
+static const struct file_operations nova_seq_ppt_fops = {
+	.owner		= THIS_MODULE,
+	.open		= nova_seq_ppt_open,
+	.read		= seq_read,
+	.write		= nova_seq_ppt,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+ssize_t nova_seq_ppto(struct file *filp, const char __user *buf, size_t len, loff_t *ppos)
+{
+  char *_buf;
+	int retval = len;
+	unsigned long long val;
+
+	_buf = kmalloc(len, GFP_KERNEL);
+	if (_buf == NULL)  {
+		retval = -ENOMEM;
+		goto out;
+	}
+	if (copy_from_user(_buf, buf, len)) {
+		retval = -EFAULT;
+		goto out;
+	}
+	_buf[len] = 0;
+	sscanf(_buf, "%llu", &val);
+	atomic64_set(&nova_pmem_pages, val);
+	atomic64_set(&nova_dram_pages, val);
+out:
+  return retval;
+}
+
+static int nova_seq_ppto_show(struct seq_file *seq, void *v)
+{
+	seq_printf(seq, "PMEM: %llu\n", atomic64_read(&nova_pmem_pages)*PAGE_SIZE/1024);
+	seq_printf(seq, "DRAM: %llu\n", atomic64_read(&nova_dram_pages)*PAGE_SIZE/1024);
+	return 0;
+}
+
+static int nova_seq_ppto_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, nova_seq_ppto_show, PDE_DATA(inode));
+}
+
+static const struct file_operations nova_seq_ppto_fops = {
+	.owner		= THIS_MODULE,
+	.open		= nova_seq_ppto_open,
+	.read		= seq_read,
+	.write		= nova_seq_ppto,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+ssize_t nova_seq_migrate(struct file *filp, const char __user *buf, size_t len, loff_t *ppos)
+{
+  	char *_buf;
+	int retval = len;
+	unsigned long long val;
+
+	_buf = kmalloc(len, GFP_KERNEL);
+	if (_buf == NULL)  {
+		retval = -ENOMEM;
+		goto out;
+	}
+	if (copy_from_user(_buf, buf, len)) {
+		retval = -EFAULT;
+		goto out;
+	}
+	_buf[len] = 0;
+	sscanf(_buf, "%llu", &val);
+	struct task_struct* t;
+	t = find_task_by_vpid(val);
+	struct mm_struct *mm = t->mm;
+	nova_daxvm_migrate_pgtables(mm, 0);
+out:
+  	return retval;
+}
+
+static int nova_seq_migrate_show(struct seq_file *seq, void *v)
+{
+	seq_printf(seq, "Everything is fine!\n");
+	return 0;
+}
+
+static int nova_seq_migrate_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, nova_seq_migrate_show, PDE_DATA(inode));
+}
+
+static const struct file_operations nova_seq_migrate_fops = {
+	.owner		= THIS_MODULE,
+	.open		= nova_seq_migrate_open,
+	.read		= seq_read,
+	.write		= nova_seq_migrate,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+
+ssize_t nova_zero_fallocate_write(struct file *filp, const char __user *buf, size_t len, loff_t *ppos)
+{
+  char *_buf;
+	int retval = len;
+
+	_buf = kmalloc(len, GFP_KERNEL);
+	if (_buf == NULL)  {
+		retval = -ENOMEM;
+		goto out;
+	}
+	if (copy_from_user(_buf, buf, len)) {
+		retval = -EFAULT;
+		goto out;
+	}
+	_buf[len] = 0;
+	sscanf(_buf, "%i", &nova_zeroout);
+
+out:
+  return retval;
+}
+
+static int nova_zero_fallocate_show(struct seq_file *seq, void *v)
+{
+	seq_printf(seq, "%i\n", nova_zeroout);
+	return 0;
+}
+
+static int nova_zero_fallocate_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, nova_zero_fallocate_show, PDE_DATA(inode));
+}
+
+static const struct file_operations nova_zero_fops = {
+	.owner		= THIS_MODULE,
+	.open		= nova_zero_fallocate_open,
+	.read		= seq_read,
+	.write		= nova_zero_fallocate_write,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+#endif
+
 /* ====================== Setup/teardown======================== */
 void nova_sysfs_init(struct super_block *sb)
 {
@@ -521,6 +696,16 @@ void nova_sysfs_init(struct super_block *sb)
 				 &nova_seq_test_perf_fops, sb);
 		proc_create_data("gc", 0444, sbi->s_proc,
 				 &nova_seq_gc_fops, sb);
+#ifdef CONFIG_DAXVM
+		proc_create_data("daxvm_zeroout_blocks", 0666, sbi->s_proc,
+				 &nova_zero_fops, sb);
+		proc_create_data("daxvm_page_tables_on", 0666, sbi->s_proc,
+				 &nova_seq_ppt_fops, sb);
+		proc_create_data("daxvm_kbytes_occupied", 0666, sbi->s_proc,
+				 &nova_seq_ppto_fops, sb);
+		proc_create_data("migrate", 0666, sbi->s_proc,
+				 &nova_seq_migrate_fops, sb);
+#endif
 	}
 }
 

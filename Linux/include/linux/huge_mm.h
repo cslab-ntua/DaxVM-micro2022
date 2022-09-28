@@ -111,8 +111,8 @@ static inline bool __transparent_hugepage_enabled(struct vm_area_struct *vma)
 	if (transparent_hugepage_flags & (1 << TRANSPARENT_HUGEPAGE_FLAG))
 		return true;
 
-	if (vma_is_dax(vma))
-		return true;
+	//if (vma_is_dax(vma))
+	//	return true;
 
 	if (transparent_hugepage_flags &
 				(1 << TRANSPARENT_HUGEPAGE_REQ_MADV_FLAG))
@@ -137,6 +137,12 @@ bool transparent_hugepage_enabled(struct vm_area_struct *vma);
 extern unsigned long thp_get_unmapped_area(struct file *filp,
 		unsigned long addr, unsigned long len, unsigned long pgoff,
 		unsigned long flags);
+
+#ifdef CONFIG_DAXVM
+extern unsigned long daxvm_ephemeral_thp_get_unmapped_area(struct file *filp,
+		unsigned long addr, unsigned long len, unsigned long pgoff,
+		unsigned long flags);
+#endif
 
 extern void prep_transhuge_page(struct page *page);
 extern void free_transhuge_page(struct page *page);

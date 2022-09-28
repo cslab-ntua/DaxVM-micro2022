@@ -61,6 +61,16 @@ void nova_init_header(struct super_block *sb,
 	sih->alter_log_head = 0;
 	sih->alter_log_tail = 0;
 	sih->i_blk_type = NOVA_DEFAULT_BLOCK_TYPE;
+
+#ifdef CONFIG_DAXVM
+  sih->ppgd=NULL;
+ 	sih->ppt_level=4;
+  sih->ppt_ceiling=0;
+  sih->vpgd=NULL;
+  sih->vpt_level=4;
+  sih->vpt_ceiling=0;
+#endif
+
 }
 
 static inline void set_scan_bm(unsigned long bit,

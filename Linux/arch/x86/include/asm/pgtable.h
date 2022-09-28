@@ -372,6 +372,47 @@ static inline pmd_t pmd_clear_flags(pmd_t pmd, pmdval_t clear)
 	return native_make_pmd(v & ~clear);
 }
 
+#ifdef CONFIG_DAXVM
+
+#define PMD_DAXVM_EPHEMERAL_MASK (_AT(pteval_t, 1) << 11)
+static inline pmd_t pmd_mk_daxvm_ephemeral(pmd_t pmd)
+{
+  return pmd_set_flags(pmd, PMD_DAXVM_EPHEMERAL_MASK);
+}
+
+static inline pmd_t pmd_clear_daxvm_ephemeral(pmd_t pmd)
+{
+  return pmd_clear_flags(pmd, PMD_DAXVM_EPHEMERAL_MASK);
+}
+
+static inline int is_pmd_daxvm_ephemeral(pmd_t pmd)
+{
+   if(native_pmd_val(pmd) & PMD_DAXVM_EPHEMERAL_MASK)
+        return 1;
+   else
+        return 0;
+}
+
+#define PMD_DAXVM_MASK (_AT(pteval_t, 1) << 10)
+static inline pmd_t pmd_mk_daxvm(pmd_t pmd)
+{
+  return pmd_set_flags(pmd, PMD_DAXVM_MASK);
+}
+
+static inline pmd_t pmd_clear_daxvm(pmd_t pmd)
+{
+  return pmd_clear_flags(pmd, PMD_DAXVM_MASK);
+}
+
+static inline int is_pmd_daxvm(pmd_t pmd)
+{
+   if(native_pmd_val(pmd) & PMD_DAXVM_MASK)
+        return 1;
+   else
+        return 0;
+}
+#endif
+
 static inline pmd_t pmd_mkold(pmd_t pmd)
 {
 	return pmd_clear_flags(pmd, _PAGE_ACCESSED);
@@ -819,10 +860,17 @@ static inline pte_t *pte_offset_kernel(pmd_t *pmd, unsigned long address)
 	return (pte_t *)pmd_page_vaddr(*pmd) + pte_index(address);
 }
 
+#ifdef CONFIG_DAXVM
+static inline int pmd_bad(pmd_t pmd)
+{
+	return ((pmd_flags(pmd) & ~_PAGE_USER) & ~(PMD_DAXVM_EPHEMERAL_MASK | PMD_DAXVM_MASK)) != _KERNPG_TABLE ;
+}
+#else
 static inline int pmd_bad(pmd_t pmd)
 {
 	return (pmd_flags(pmd) & ~_PAGE_USER) != _KERNPG_TABLE;
 }
+#endif
 
 static inline unsigned long pages_to_mb(unsigned long npg)
 {

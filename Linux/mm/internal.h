@@ -36,6 +36,10 @@
 /* Do not use these with a slab allocator */
 #define GFP_SLAB_BUG_MASK (__GFP_DMA32|__GFP_HIGHMEM|~__GFP_BITS_MASK)
 
+#ifdef CONFIG_DAXVM
+extern unsigned long fast_mapping_vma_size; //3GB pre-allocated address space;
+#endif
+
 void page_writeback_init(void);
 
 vm_fault_t do_swap_page(struct vm_fault *vmf);
@@ -295,6 +299,15 @@ static inline bool is_data_mapping(vm_flags_t flags)
 /* mm/util.c */
 void __vma_link_list(struct mm_struct *mm, struct vm_area_struct *vma,
 		struct vm_area_struct *prev, struct rb_node *rb_parent);
+
+#ifdef CONFIG_DAXVM
+unsigned long daxvm_ephemeral_thp_get_unmapped_area(struct file *filp, unsigned long addr, unsigned long len, unsigned long pgoff, unsigned long flags);
+void __ephemeral_mm_link_list(struct mm_struct *mm, struct vm_area_struct *vma, struct vm_area_struct *prev, struct rb_node *rb_parent);
+void __ephemeral_vma_link_list(struct vm_area_struct *mm, struct vm_area_struct *vma, struct vm_area_struct *prev, struct rb_node *rb_parent);
+extern unsigned long  __must_check vm_mmap_pgoff_ephemeral(struct file *, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long);
+void __zombie_vma_link_list(struct mm_struct *mm, struct vm_area_struct *vma,struct vm_area_struct *prev, struct rb_node *rb_parent);
+#endif
+
 
 #ifdef CONFIG_MMU
 extern long populate_vma_page_range(struct vm_area_struct *vma,

@@ -20,6 +20,11 @@
 #include "inode.h"
 #include "log.h"
 
+#ifdef CONFIG_DAXVM
+	#include <linux/pfn_t.h>
+	#include "./daxvm/daxvm.h"
+#endif
+
 static int nova_execute_invalidate_reassign_logentry(struct super_block *sb,
 	void *entry, enum nova_entry_type type, int reassign,
 	unsigned int num_free)
@@ -450,6 +455,36 @@ static int nova_append_log_entry(struct super_block *sb,
 		update->alter_entry = alter_curr_p;
 		update->alter_tail = alter_curr_p + size;
 	}
+
+#ifdef CONFIG_DAXVM
+	if ((type == FILE_WRITE) && nova_persistent_page_tables){
+		if(entry_info && entry_info->data) {
+  		struct nova_file_write_entry *write_entry;
+  		write_entry = (struct nova_file_write_entry*) entry_info->data;
+			if (write_entry && write_entry->num_pages){
+				unsigned long m_pblk = write_entry->block>>PAGE_SHIFT;
+				unsigned long m_lblk = write_entry->pgoff;
+				unsigned long m_len = write_entry->num_pages;
+
+  			struct nova_sb_info *sbi = NOVA_SB(sb);
+/*
+				if(((m_lblk+m_len)<<PAGE_SHIFT) <= nova_daxvm_pmem_threshold)
+					nova_daxvm_build_tables(inode, m_len, m_pblk, m_lblk, 0);
+				else {
+					if(sih->vpgd) {
+						nova_daxvm_migrate_file_pgtables(inode, 1);
+						nova_daxvm_build_tables(inode, m_len, m_pblk, m_lblk, 1);
+					}
+					else {
+						nova_daxvm_build_tables(inode, m_len, m_pblk, m_lblk, 1);
+					}
+				}
+*/
+			  nova_daxvm_build_tables(inode, m_len, m_pblk, m_lblk, 1);
+			}
+		}
+	}
+#endif
 
 	entry_info->curr_p = curr_p;
 	return 0;

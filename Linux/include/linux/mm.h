@@ -257,6 +257,18 @@ extern unsigned int kobjsize(const void *objp);
 #define VM_HIGH_ARCH_2	BIT(VM_HIGH_ARCH_BIT_2)
 #define VM_HIGH_ARCH_3	BIT(VM_HIGH_ARCH_BIT_3)
 #define VM_HIGH_ARCH_4	BIT(VM_HIGH_ARCH_BIT_4)
+
+#ifdef CONFIG_DAXVM
+#define VM_HIGH_ARCH_BIT_5	37	/* bit only usable on 64-bit architectures */
+#define VM_HIGH_ARCH_BIT_6	38	/* bit only usable on 64-bit architectures */
+#define VM_HIGH_ARCH_BIT_7	39	/* bit only usable on 64-bit architectures */
+#define VM_HIGH_ARCH_BIT_8	40	/* bit only usable on 64-bit architectures */
+
+#define VM_DAXVM			                BIT(VM_HIGH_ARCH_BIT_5)
+#define VM_DAXVM_EPHEMERAL		        BIT(VM_HIGH_ARCH_BIT_6)
+#define VM_DAXVM_EPHEMERAL_HEAP		    BIT(VM_HIGH_ARCH_BIT_7)
+#define VM_DAXVM_BATCHING		          BIT(VM_HIGH_ARCH_BIT_8)
+#endif
 #endif /* CONFIG_ARCH_USES_HIGH_VMA_FLAGS */
 
 #ifdef CONFIG_ARCH_HAS_PKEYS
@@ -490,6 +502,12 @@ static inline void vma_init(struct vm_area_struct *vma, struct mm_struct *mm)
 	vma->vm_mm = mm;
 	vma->vm_ops = &dummy_vm_ops;
 	INIT_LIST_HEAD(&vma->anon_vma_chain);
+
+#ifdef CONFIG_DAXVM
+	vma->ephemeral_mmap = NULL;
+	vma->ephemeral_mm_rb = RB_ROOT;
+	spin_lock_init(&vma->ephemeral_lock);
+#endif
 }
 
 static inline void vma_set_anonymous(struct vm_area_struct *vma)
@@ -2349,6 +2367,24 @@ do_mmap_pgoff(struct file *file, unsigned long addr,
 {
 	return do_mmap(file, addr, len, prot, flags, 0, pgoff, populate, uf);
 }
+
+#ifdef CONFIG_DAXVM
+extern struct vm_area_struct * find_ephemeral_vma(struct vm_area_struct * mm, unsigned long addr);
+extern struct vm_area_struct * find_ephemeral_mm(struct mm_struct * mm, unsigned long addr);
+extern unsigned long do_mmap_ephemeral(struct file *file, unsigned long addr, unsigned long len, unsigned long prot, unsigned long flags, vm_flags_t vm_flags, unsigned long pgoff, unsigned long *populate, struct list_head *uf);
+extern unsigned long daxvm_get_unmapped_area(struct file *, unsigned long , unsigned long , unsigned long, unsigned long);
+static inline unsigned long do_mmap_pgoff_ephemeral(struct file *file, unsigned long addr, unsigned long len, unsigned long prot, unsigned long flags, unsigned long pgoff, unsigned long *populate, struct list_head *uf)
+{
+	return do_mmap_ephemeral(file, addr, len, prot, flags, 0, pgoff, populate, uf);
+}
+extern unsigned long get_unmapped_area_ephemeral(struct file *, unsigned long, unsigned long, unsigned long, unsigned long);
+void unmap_ephemeral_vmas(struct mmu_gather *tlb, struct vm_area_struct *start_vma, unsigned long start, unsigned long end);
+
+#define DEFAULT_MAX_ZOMBIE_PAGES	33
+extern int sysctl_max_zombie_pages;
+void unmap_zombie_vmas(struct mmu_gather *tlb, struct vm_area_struct *start_vma,unsigned long start, unsigned long end);
+#endif
+
 
 #ifdef CONFIG_MMU
 extern int __mm_populate(unsigned long addr, unsigned long len,

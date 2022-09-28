@@ -360,8 +360,8 @@ void nova_print_inode(struct nova_inode *pi)
 		pi->valid, pi->deleted, pi->i_blk_type, pi->i_flags);
 	nova_dbg("size %llu, ctime %u, mtime %u, atime %u\n",
 		pi->i_size, pi->i_ctime, pi->i_mtime, pi->i_atime);
-	nova_dbg("mode %u, links %u, xattr 0x%llx, csum %u\n",
-		pi->i_mode, pi->i_links_count, pi->i_xattr, pi->csum);
+	//nova_dbg("mode %u, links %u, xattr 0x%llx, csum %u\n",
+		//pi->i_mode, pi->i_links_count, pi->i_xattr, pi->csum);
 	nova_dbg("uid %u, gid %u, gen %u, create time %u\n",
 		pi->i_uid, pi->i_gid, pi->i_generation, pi->i_create_time);
 	nova_dbg("head 0x%llx, tail 0x%llx, alter head 0x%llx, tail 0x%llx\n",

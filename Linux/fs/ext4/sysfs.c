@@ -383,6 +383,134 @@ static struct kobject *ext4_root;
 
 static struct kobject *ext4_feat;
 
+#ifdef CONFIG_DAXVM
+ssize_t ext4_seq_ppt(struct file *filp, const char __user *buf, size_t len, loff_t *ppos)
+{
+  char *_buf;
+	int retval = len;
+
+	_buf = kmalloc(len, GFP_KERNEL);
+	if (_buf == NULL)  {
+		retval = -ENOMEM;
+		goto out;
+	}
+	if (copy_from_user(_buf, buf, len)) {
+		retval = -EFAULT;
+		goto out;
+	}
+	_buf[len] = 0;
+	sscanf(_buf, "%i", &ext4_persistent_page_tables);
+out:
+  return retval;
+}
+
+static int ext4_seq_ppt_show(struct seq_file *seq, void *v)
+{
+	seq_printf(seq, "%i\n", ext4_persistent_page_tables);
+	return 0;
+}
+
+static int ext4_seq_ppt_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, ext4_seq_ppt_show, PDE_DATA(inode));
+}
+
+static const struct file_operations ext4_seq_ppt_fops = {
+	.owner		= THIS_MODULE,
+	.open		= ext4_seq_ppt_open,
+	.read		= seq_read,
+	.write		= ext4_seq_ppt,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+ssize_t ext4_seq_ppto(struct file *filp, const char __user *buf, size_t len, loff_t *ppos)
+{
+  char *_buf;
+	int retval = len;
+	unsigned long long val;
+
+	_buf = kmalloc(len, GFP_KERNEL);
+	if (_buf == NULL)  {
+		retval = -ENOMEM;
+		goto out;
+	}
+	if (copy_from_user(_buf, buf, len)) {
+		retval = -EFAULT;
+		goto out;
+	}
+	_buf[len] = 0;
+	sscanf(_buf, "%llu", &val);
+	atomic64_set(&ext4_pmem_pages, val);
+	atomic64_set(&ext4_dram_pages, val);
+out:
+  return retval;
+}
+
+static int ext4_seq_ppto_show(struct seq_file *seq, void *v)
+{
+	seq_printf(seq, "PMEM: %llu\n", atomic64_read(&ext4_pmem_pages)*PAGE_SIZE/1024);
+	seq_printf(seq, "DRAM: %llu\n", atomic64_read(&ext4_dram_pages)*PAGE_SIZE/1024);
+	return 0;
+}
+
+static int ext4_seq_ppto_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, ext4_seq_ppto_show, PDE_DATA(inode));
+}
+
+static const struct file_operations ext4_seq_ppto_fops = {
+	.owner		= THIS_MODULE,
+	.open		= ext4_seq_ppto_open,
+	.read		= seq_read,
+	.write		= ext4_seq_ppto,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+#include "./daxvm/daxvm.h"
+ssize_t ext4_zero_fallocate_write(struct file *filp, const char __user *buf, size_t len, loff_t *ppos)
+{
+  char *_buf;
+	int retval = len;
+
+	_buf = kmalloc(len, GFP_KERNEL);
+	if (_buf == NULL)  {
+		retval = -ENOMEM;
+		goto out;
+	}
+	if (copy_from_user(_buf, buf, len)) {
+		retval = -EFAULT;
+		goto out;
+	}
+	_buf[len] = 0;
+	sscanf(_buf, "%i", &ext4_zeroout);
+
+out:
+  return retval;
+}
+
+static int ext4_zero_fallocate_show(struct seq_file *seq, void *v)
+{
+	seq_printf(seq, "%i\n", ext4_zeroout);
+	return 0;
+}
+
+static int ext4_zero_fallocate_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, ext4_zero_fallocate_show, PDE_DATA(inode));
+}
+
+static const struct file_operations ext4_zero_fops = {
+	.owner		= THIS_MODULE,
+	.open		= ext4_zero_fallocate_open,
+	.read		= seq_read,
+	.write		= ext4_zero_fallocate_write,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+#endif
+
 int ext4_register_sysfs(struct super_block *sb)
 {
 	struct ext4_sb_info *sbi = EXT4_SB(sb);
@@ -407,6 +535,14 @@ int ext4_register_sysfs(struct super_block *sb)
 				sb);
 		proc_create_seq_data("mb_groups", S_IRUGO, sbi->s_proc,
 				&ext4_mb_seq_groups_ops, sb);
+#ifdef CONFIG_DAXVM
+		proc_create_data("daxvm_zeroout_blocks", 0666, sbi->s_proc,
+				 &ext4_zero_fops, sb);
+		proc_create_data("daxvm_page_tables_on", 0666, sbi->s_proc,
+				 &ext4_seq_ppt_fops, sb);
+		proc_create_data("daxvm_kbytes_occupied", 0666, sbi->s_proc,
+				 &ext4_seq_ppto_fops, sb);
+#endif
 	}
 	return 0;
 }
@@ -460,4 +596,5 @@ void ext4_exit_sysfs(void)
 	remove_proc_entry(proc_dirname, NULL);
 	ext4_proc_root = NULL;
 }
+
 

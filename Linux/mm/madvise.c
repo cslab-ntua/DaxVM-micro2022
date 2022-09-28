@@ -61,6 +61,12 @@ static long madvise_behavior(struct vm_area_struct *vma,
 	pgoff_t pgoff;
 	unsigned long new_flags = vma->vm_flags;
 
+#ifdef CONFIG_DAXVM
+	if(vma->vm_flags & (VM_DAXVM|VM_DAXVM_EPHEMERAL_HEAP)){
+		return 0;
+	}
+#endif
+
 	switch (behavior) {
 	case MADV_NORMAL:
 		new_flags = new_flags & ~VM_RAND_READ & ~VM_SEQ_READ;
@@ -689,6 +695,12 @@ static long
 madvise_vma(struct vm_area_struct *vma, struct vm_area_struct **prev,
 		unsigned long start, unsigned long end, int behavior)
 {
+#ifdef CONFIG_DAXVM
+	if(vma->vm_flags & (VM_DAXVM|VM_DAXVM_EPHEMERAL_HEAP)){
+    		BUG();
+		return 0;
+	}
+#endif
 	switch (behavior) {
 	case MADV_REMOVE:
 		return madvise_remove(vma, prev, start, end);

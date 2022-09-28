@@ -35,7 +35,11 @@ struct nova_inode {
 	__le16	i_mode;		 /* File mode */
 	__le16	i_links_count;	 /* Links count */
 
+#ifndef CONFIG_DAXVM
 	__le64	i_xattr;	 /* Extended attribute block */
+#else
+	__le64	ppgd;		/* Fast NVMM persistent page tables */
+#endif
 
 	/* second 40 bytes */
 	__le32	i_uid;		 /* Owner Uid */
@@ -99,6 +103,17 @@ struct nova_inode_info_header {
 	u64 alter_log_head;		/* Alternate log head pointer */
 	u64 alter_log_tail;		/* Alternate log tail pointer */
 	u8  i_blk_type;
+
+#ifdef CONFIG_DAXVM     
+  void *ppgd;
+  unsigned long ppt_ceiling;
+  u16 ppt_level;
+  
+  void *vpgd;
+  unsigned long vpt_ceiling;
+  u16 vpt_level;
+#endif
+
 };
 
 /* For rebuild purpose, temporarily store pi infomation */
