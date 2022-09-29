@@ -1,0 +1,2 @@
+Throughput: 2170.860317
+Time taken: 47.170239
